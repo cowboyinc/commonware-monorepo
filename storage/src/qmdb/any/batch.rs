@@ -610,21 +610,36 @@ where
         // This includes keys from both the base snapshot and the base diff.
         for (op, &old_loc) in results.iter().zip(&locations) {
             let key = op.key().expect("updates should have a key");
+
+            // Backport of upstream PR #3476:
+            // [storage/qmdb] Fix path-dependent key selection in `any::unordered`
+            // https://github.com/commonwarexyz/monorepo/pull/3476
+            //
+            // A key resolved via base_diff must only match at its base_diff
+            // location. Without this guard, a stale snapshot collision (the
+            // pre-parent DB snapshot still containing the key's old location)
+            // can consume the mutation at the wrong sort position, changing
+            // the operation order relative to the committed-state path. When
+            // the base diff entry does match, use it to trace `base_old_loc`
+            // back to the key's location in the base DB snapshot.
+            let base_old_loc = if let Some(entry) = m.base_diff.get(key) {
+                if entry.loc() != Some(old_loc) {
+                    continue;
+                }
+                entry.base_old_loc()
+            } else {
+                Some(old_loc)
+            };
+
             let Some(mutation) = mutations.remove(key) else {
                 // Snapshot index collision: this operation's key does not match
-                // the mutation key (the snapshot uses a compressed translated key
-                // that can collide). The mutation will be handled as a create below.
+                // any mutation key. The mutation will be handled as a create below.
                 continue;
             };
 
+            // Write the user mutation at the next batch location while
+            // preserving the committed-base provenance computed above.
             let new_loc = Location::new(m.base_size + ops.len() as u64);
-
-            // Determine base_old_loc: trace through base diff to find
-            // the key's location in the base DB snapshot.
-            let base_old_loc = m
-                .base_diff
-                .get(key)
-                .map_or(Some(old_loc), DiffEntry::base_old_loc);
 
             match mutation {
                 Some(value) => {
