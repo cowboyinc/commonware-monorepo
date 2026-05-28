@@ -737,6 +737,7 @@ impl<
 
         // Rebuild from journal
         let start = self.context.current();
+        let mut replayed_votes = Vec::new();
         {
             let stream = journal
                 .replay(0, 0, self.replay_buffer)
@@ -749,6 +750,7 @@ impl<
                 match artifact {
                     Artifact::Notarize(notarize) => {
                         self.handle_notarize(notarize.clone()).await;
+                        replayed_votes.push(Vote::Notarize(notarize.clone()));
                         self.reporter.report(Activity::Notarize(notarize)).await;
                     }
                     Artifact::Notarization(notarization) => {
@@ -775,6 +777,7 @@ impl<
                     }
                     Artifact::Nullify(nullify) => {
                         self.handle_nullify(nullify.clone()).await;
+                        replayed_votes.push(Vote::Nullify(nullify.clone()));
                         self.reporter.report(Activity::Nullify(nullify)).await;
                     }
                     Artifact::Nullification(nullification) => {
@@ -788,6 +791,7 @@ impl<
                     }
                     Artifact::Finalize(finalize) => {
                         self.handle_finalize(finalize.clone()).await;
+                        replayed_votes.push(Vote::Finalize(finalize.clone()));
                         self.reporter.report(Activity::Finalize(finalize)).await;
                     }
                     Artifact::Finalization(finalization) => {
@@ -825,6 +829,14 @@ impl<
         {
             debug!(%observed_view, %leader, ?reason, "nullifying round");
             self.state.trigger_timeout(observed_view, reason);
+        }
+
+        // Rehydrate persisted local votes after the batcher knows the recovered
+        // view. Otherwise votes far ahead of the batcher's initial view 0 are
+        // dropped as uninteresting and single-node restarts can never rebuild
+        // their quorum certificates.
+        for vote in replayed_votes {
+            batcher.constructed(vote).await;
         }
 
         // Process messages
