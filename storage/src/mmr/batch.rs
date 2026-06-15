@@ -169,12 +169,10 @@ impl<'a, D: Digest, P: Readable<D>> UnmerkleizedBatch<'a, D, P> {
         let leaf_pos = self.size();
         self.appended.push(digest);
 
-        let mut height = 1;
-        for _ in nodes_needing_parents {
+        for (height, _) in (1..).zip(nodes_needing_parents) {
             let new_node_pos = self.size();
             self.appended.push(D::EMPTY);
             self.state.insert(new_node_pos, height);
-            height += 1;
         }
 
         leaf_pos

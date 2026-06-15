@@ -22,6 +22,7 @@ use commonware_codec::Codec;
 use commonware_cryptography::{Digest, Hasher};
 use commonware_runtime::{Clock, Metrics, Storage};
 use futures::stream::Stream;
+use std::future::Future;
 
 /// Proof information for verifying a key has a particular value in the database.
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -82,14 +83,18 @@ where
 
     /// Streams all active (key, value) pairs in the database in key order, starting from the first
     /// active key greater than or equal to `start`.
-    pub async fn stream_range<'a>(
+    #[allow(clippy::manual_async_fn)] // Expose the returned future's `Send` bound.
+    pub fn stream_range<'a>(
         &'a self,
         start: K,
-    ) -> Result<impl Stream<Item = Result<(K, V::Value), Error>> + 'a, Error>
+    ) -> impl Future<
+        Output = Result<impl Stream<Item = Result<(K, V::Value), Error>> + Send + 'a, Error>,
+    > + Send
+           + 'a
     where
         V: 'a,
     {
-        self.any.stream_range(start).await
+        async move { self.any.stream_range(start).await }
     }
 
     /// Return true if the proof authenticates that `key` does _not_ exist in the db with the

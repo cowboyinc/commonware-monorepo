@@ -20,6 +20,7 @@ use futures::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     ops::Bound,
 };
 
@@ -159,45 +160,54 @@ where
 
     /// Streams all active (key, value) pairs in the database in key order, starting from the first
     /// active key greater than or equal to `start`.
-    pub async fn stream_range<'a>(
+    #[allow(clippy::manual_async_fn)] // Expose the returned future's `Send` bound.
+    pub fn stream_range<'a>(
         &'a self,
         start: K,
-    ) -> Result<impl Stream<Item = Result<(K, V::Value), Error>> + 'a, Error>
+    ) -> impl Future<
+        Output = Result<impl Stream<Item = Result<(K, V::Value), Error>> + Send + 'a, Error>,
+    > + Send
+           + 'a
     where
         V: 'a,
         V::Value: Send + Sync,
     {
-        let start_iter = self.snapshot.get(&start);
-        let mut init_pending = self.fetch_all_updates(start_iter).await?;
-        init_pending.retain(|x| x.key >= start);
+        async move {
+            let start_locs: Vec<Location> = self.snapshot.get(&start).copied().collect();
+            let mut init_pending = self.fetch_all_updates(&start_locs).await?;
+            init_pending.retain(|x| x.key >= start);
 
-        Ok(stream::unfold(
-            (start, init_pending),
-            move |(driver_key, mut pending): (K, Vec<Update<K, V>>)| async move {
-                if !pending.is_empty() {
-                    let item = pending.pop().expect("pending is not empty");
-                    return Some((Ok((item.key, item.value)), (driver_key, pending)));
-                }
-
-                let Some((iter, wrapped)) = self.snapshot.next_translated_key(&driver_key) else {
-                    return None; // DB is empty
-                };
-                if wrapped {
-                    return None; // End of DB
-                }
-
-                // TODO(https://github.com/commonwarexyz/monorepo/issues/2527): concurrently
-                // fetch a much larger batch of "pending" keys.
-                match self.fetch_all_updates(iter).await {
-                    Ok(mut pending) => {
+            Ok(stream::unfold(
+                (start, init_pending),
+                move |(driver_key, mut pending): (K, Vec<Update<K, V>>)| async move {
+                    if !pending.is_empty() {
                         let item = pending.pop().expect("pending is not empty");
-                        let key = item.key.clone();
-                        Some((Ok((item.key, item.value)), (key, pending)))
+                        return Some((Ok((item.key, item.value)), (driver_key, pending)));
                     }
-                    Err(e) => Some((Err(e), (driver_key, pending))),
-                }
-            },
-        ))
+
+                    let Some((iter, wrapped)) = self.snapshot.next_translated_key(&driver_key)
+                    else {
+                        return None; // DB is empty
+                    };
+                    if wrapped {
+                        return None; // End of DB
+                    }
+
+                    let locs: Vec<Location> = iter.copied().collect();
+
+                    // TODO(https://github.com/commonwarexyz/monorepo/issues/2527): concurrently
+                    // fetch a much larger batch of "pending" keys.
+                    match self.fetch_all_updates(&locs).await {
+                        Ok(mut pending) => {
+                            let item = pending.pop().expect("pending is not empty");
+                            let key = item.key.clone();
+                            Some((Ok((item.key, item.value)), (key, pending)))
+                        }
+                        Err(e) => Some((Err(e), (driver_key, pending))),
+                    }
+                },
+            ))
+        }
     }
 
     /// Fetches all update operations corresponding to the input locations, returning the result in
