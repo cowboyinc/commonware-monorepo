@@ -970,12 +970,12 @@ pub(super) mod test {
             let mut kvs_first: Vec<(Digest, Vec<u8>)> = (0u64..5)
                 .map(|i| (Sha256::hash(&i.to_be_bytes()), vec![i as u8; 8]))
                 .collect();
-            kvs_first.sort_by(|a, b| a.0.cmp(&b.0));
+            kvs_first.sort_by_key(|(k, _)| *k);
 
             let mut kvs_second: Vec<(Digest, Vec<u8>)> = (5u64..10)
                 .map(|i| (Sha256::hash(&i.to_be_bytes()), vec![i as u8; 8]))
                 .collect();
-            kvs_second.sort_by(|a, b| a.0.cmp(&b.0));
+            kvs_second.sort_by_key(|(k, _)| *k);
 
             // Parent batch: set keys 0..5.
             let mut parent = db.new_batch();
