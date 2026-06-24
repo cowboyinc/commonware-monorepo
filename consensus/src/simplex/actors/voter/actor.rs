@@ -707,6 +707,7 @@ impl<
 
         // Rebuild from journal
         let start = self.context.current();
+        let mut replayed_votes = Vec::new();
         {
             let stream = journal
                 .replay(0, 0, self.replay_buffer)
@@ -723,6 +724,7 @@ impl<
                 match artifact {
                     Artifact::Notarize(notarize) => {
                         self.handle_notarize(notarize.clone()).await;
+                        replayed_votes.push(Vote::Notarize(notarize.clone()));
                         self.reporter.report(Activity::Notarize(notarize));
                     }
                     Artifact::Notarization(notarization) => {
@@ -743,6 +745,7 @@ impl<
                     }
                     Artifact::Nullify(nullify) => {
                         self.handle_nullify(nullify.clone()).await;
+                        replayed_votes.push(Vote::Nullify(nullify.clone()));
                         self.reporter.report(Activity::Nullify(nullify));
                     }
                     Artifact::Nullification(nullification) => {
@@ -752,6 +755,7 @@ impl<
                     }
                     Artifact::Finalize(finalize) => {
                         self.handle_finalize(finalize.clone()).await;
+                        replayed_votes.push(Vote::Finalize(finalize.clone()));
                         self.reporter.report(Activity::Finalize(finalize));
                     }
                     Artifact::Finalization(finalization) => {
@@ -761,13 +765,9 @@ impl<
                     }
                 }
 
-                // We deliberately avoid re-seeding the batcher with our
-                // own votes (or the votes of other peers) on replay. We assume that
-                // whatever view we were in during shutdown is no longer the latest
-                // and we'll quickly jump ahead to a new view.
-                //
-                // If this is not the case (cluster-wide shutdown), we will recover
-                // when timing out.
+                // Local votes (notarize/nullify/finalize) are collected into
+                // `replayed_votes` above and re-seeded into the batcher after the
+                // startup update below (see the rehydration note there).
             }
         }
         self.journal = Some(journal);
@@ -788,6 +788,17 @@ impl<
             .leader_index(observed_view)
             .expect("leader not set");
         batcher.update(observed_view, leader, self.state.last_finalized(), None);
+
+        // Rehydrate persisted local votes now that the batcher knows the
+        // recovered view. Otherwise votes far ahead of the batcher's initial
+        // view 0 are dropped as uninteresting and a single-node validator can
+        // never rebuild its quorum certificates on restart. Upstream
+        // deliberately drops replayed local votes on the assumption the node
+        // will quickly jump ahead to a new view; that assumption is false for a
+        // single validator (cowboy fork commit 06c54367).
+        for vote in replayed_votes {
+            batcher.constructed(vote);
+        }
 
         // Process messages
         let mut pending_propose: Option<Request<Context<D, S::PublicKey>, D>> = None;

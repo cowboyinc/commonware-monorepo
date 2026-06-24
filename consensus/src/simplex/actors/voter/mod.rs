@@ -2441,6 +2441,185 @@ mod tests {
         startup_update_timeout_hint_nullifies_recovered_view::<_, _>(secp256r1::fixture);
     }
 
+    // Regression test for the single-validator restart liveness bug.
+    //
+    // A local nullify persisted before shutdown must be re-seeded into the
+    // batcher after the startup batcher update so a single-node validator can
+    // rebuild its quorum certificate on restart. Upstream deliberately drops
+    // replayed local votes on the assumption the node "will quickly jump ahead
+    // to a new view"; that assumption is false for a single validator far ahead
+    // of the batcher's initial view 0 (cowboy fork commit 06c54367).
+    #[test_traced]
+    fn test_replayed_local_nullify_rehydrates_batcher_after_startup_update() {
+        let n = 1;
+        let quorum = quorum(n);
+        let namespace = b"replayed_local_nullify_rehydrates_batcher".to_vec();
+        let executor = deterministic::Runner::timed(Duration::from_secs(30));
+        executor.start(|mut context| async move {
+            let Fixture {
+                participants,
+                schemes,
+                ..
+            } = ed25519::fixture(&mut context, &namespace, n);
+            let oracle =
+                start_test_network_with_peers(context.child("network"), participants.clone(), true)
+                    .await;
+            let me = participants[0].clone();
+
+            let elector = RoundRobin::<Sha256>::default();
+            let reporter_cfg = mocks::reporter::Config {
+                participants: participants.clone().try_into().unwrap(),
+                scheme: schemes[0].clone(),
+                elector: elector.clone(),
+            };
+            let reporter = mocks::reporter::Reporter::new(context.child("reporter"), reporter_cfg);
+            let relay = Arc::new(mocks::relay::Relay::new());
+            let app_cfg = mocks::application::Config {
+                hasher: Sha256::default(),
+                relay: relay.clone(),
+                me: me.clone(),
+                // Keep proposals out of the way so this test isolates the nullify path.
+                propose_latency: (10_000.0, 0.0),
+                verify_latency: (1.0, 0.0),
+                certify_latency: (1.0, 0.0),
+                should_certify: mocks::application::Certifier::Always,
+            };
+            let (app_actor, application) =
+                mocks::application::Application::new(context.child("app"), app_cfg);
+            app_actor.start();
+
+            let partition = "replayed_local_nullify_rehydrates_batcher".to_string();
+            let epoch = Epoch::new(333);
+            let target_view = View::new(3);
+            let make_cfg = |page_cache: CacheRef| Config {
+                scheme: schemes[0].clone(),
+                elector: elector.clone(),
+                blocker: oracle.control(me.clone()),
+                automaton: application.clone(),
+                relay: application.clone(),
+                reporter: reporter.clone(),
+                partition: partition.clone(),
+                epoch,
+                floor: Floor::Genesis(mocks::application::genesis::<Sha256>(epoch)),
+                mailbox_size: NZUsize!(128),
+                leader_timeout: Duration::from_secs(10),
+                certification_timeout: Duration::from_secs(10),
+                timeout_retry: Duration::from_mins(60),
+                activity_timeout: ViewDelta::new(10),
+                replay_buffer: NZUsize!(1024 * 1024),
+                write_buffer: NZUsize!(1024 * 1024),
+                page_cache,
+            };
+
+            // First run: advance to a later view and persist a local nullify for it.
+            let cfg = make_cfg(CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE));
+            let (voter, mut mailbox) = Actor::new(context.child("voter_initial"), cfg);
+
+            let (resolver_sender, _resolver_receiver) =
+                mailbox::new(context.child("resolver_mailbox"), NZUsize!(8));
+            let (batcher_sender, mut batcher_receiver) =
+                mailbox::new(context.child("batcher_mailbox"), NZUsize!(32));
+            let (vote_sender, _) = oracle.control(me.clone()).register(0, TEST_QUOTA).await.unwrap();
+            let (certificate_sender, _) =
+                oracle.control(me.clone()).register(1, TEST_QUOTA).await.unwrap();
+            let handle = voter.start(
+                batcher::Mailbox::new(batcher_sender),
+                resolver::Mailbox::new(resolver_sender),
+                vote_sender,
+                certificate_sender,
+            );
+
+            match batcher_receiver.recv().await.unwrap() {
+                batcher::Message::Update { .. } => {}
+                batcher::Message::Constructed(_) => panic!("expected initial batcher update"),
+            }
+
+            advance_to_view(
+                &mut mailbox,
+                &mut batcher_receiver,
+                &schemes,
+                quorum,
+                target_view,
+            )
+            .await;
+            mailbox.timeout(target_view, TimeoutReason::LeaderNullify);
+
+            loop {
+                select! {
+                    msg = batcher_receiver.recv() => match msg.unwrap() {
+                        batcher::Message::Constructed(Vote::Nullify(nullify))
+                            if nullify.view() == target_view =>
+                        {
+                            break;
+                        }
+                        batcher::Message::Update { .. } => {}
+                        _ => {}
+                    },
+                    _ = context.sleep(Duration::from_secs(2)) => {
+                        panic!("expected first-run nullify for view {target_view}");
+                    },
+                }
+            }
+            // Let the nullify durably land in the journal before shutting down.
+            context.sleep(Duration::from_millis(100)).await;
+            handle.abort();
+
+            // Restart from the same partition: the persisted nullify must be
+            // replayed AND re-seeded into the batcher so the single validator can
+            // rebuild its quorum certificate.
+            let cfg = make_cfg(CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE));
+            let (voter, _mailbox) = Actor::new(context.child("voter_restarted"), cfg);
+
+            let (resolver_sender, _resolver_receiver) =
+                mailbox::new(context.child("resolver_mailbox"), NZUsize!(8));
+            let (batcher_sender, mut batcher_receiver) =
+                mailbox::new(context.child("batcher_mailbox"), NZUsize!(32));
+            let (vote_sender, _) = oracle.control(me.clone()).register(2, TEST_QUOTA).await.unwrap();
+            let (certificate_sender, _) =
+                oracle.control(me.clone()).register(3, TEST_QUOTA).await.unwrap();
+            voter.start(
+                batcher::Mailbox::new(batcher_sender),
+                resolver::Mailbox::new(resolver_sender),
+                vote_sender,
+                certificate_sender,
+            );
+
+            // The startup batcher update must arrive BEFORE any replayed vote, so
+            // the batcher knows the recovered view and does not drop the vote as
+            // uninteresting.
+            match batcher_receiver.recv().await.unwrap() {
+                batcher::Message::Update {
+                    current,
+                    finalized,
+                    ..
+                } => {
+                    assert_eq!(current, target_view);
+                    assert_eq!(finalized, target_view.previous().unwrap());
+                }
+                batcher::Message::Constructed(_) => {
+                    panic!("replayed votes must be sent after the startup batcher update")
+                }
+            }
+
+            loop {
+                select! {
+                    msg = batcher_receiver.recv() => match msg.unwrap() {
+                        batcher::Message::Constructed(Vote::Nullify(nullify))
+                            if nullify.view() == target_view =>
+                        {
+                            break;
+                        }
+                        batcher::Message::Update { .. } => {}
+                        _ => {}
+                    },
+                    _ = context.sleep(Duration::from_secs(2)) => {
+                        panic!("expected replayed nullify for view {target_view}");
+                    },
+                }
+            }
+        });
+    }
+
     fn finalization_from_resolver<S, F, L>(mut fixture: F)
     where
         S: Scheme<Sha256Digest, PublicKey = PublicKey>,
