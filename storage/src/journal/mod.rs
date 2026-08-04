@@ -11,6 +11,58 @@ commonware_macros::stability_mod!(ALPHA, pub mod authenticated);
 pub mod contiguous;
 pub mod segmented;
 
+
+/// Reusable zstd decompression, shared by the segmented journals.
+///
+/// `zstd::decode_all` constructs a fresh `DCtx` on every call. Profiling a
+/// validator under load showed `ZSTD_createDCtx` at ~25% of total CPU against
+/// ~10% for the actual decompression work -- context setup cost 2.5x the
+/// decompression itself, because journal reads are many and individually small.
+///
+/// Holding one `Decompressor` per thread reuses its context across reads. The
+/// decompressed bytes are identical either way; only scratch-memory management
+/// changes, so this is safe for consensus.
+#[cfg(feature = "zstd")]
+pub(crate) mod decompress {
+    use std::cell::RefCell;
+    use zstd::bulk::Decompressor;
+
+    thread_local! {
+        static DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Decompress a single zstd frame, reusing this thread's context.
+    ///
+    /// Frames written by `zstd::bulk::compress` pledge their content size in the
+    /// header, so the output buffer is sized exactly. Frames without a pledged
+    /// size fall back to `zstd::decode_all`.
+    pub(crate) fn decode_frame(src: &[u8]) -> std::io::Result<Vec<u8>> {
+        // The pledged size sizes the output buffer, so cap what we will trust:
+        // a corrupt or malformed header could otherwise request an enormous
+        // allocation. Above the cap, fall back to streaming, which grows
+        // incrementally instead of allocating up front.
+        const MAX_PLEDGED_BYTES: u64 = 256 * 1024 * 1024;
+        let pledged = zstd::zstd_safe::get_frame_content_size(src)
+            .ok()
+            .flatten()
+            .filter(|n| *n <= MAX_PLEDGED_BYTES)
+            .and_then(|n| usize::try_from(n).ok());
+        let Some(capacity) = pledged else {
+            return zstd::decode_all(src);
+        };
+        DECOMPRESSOR.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(Decompressor::new()?);
+            }
+            slot.as_mut()
+                .expect("initialized above")
+                .decompress(src, capacity)
+        })
+    }
+}
+
 #[cfg(all(test, feature = "arbitrary"))]
 mod conformance;
 

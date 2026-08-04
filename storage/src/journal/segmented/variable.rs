@@ -93,7 +93,8 @@ use commonware_runtime::{
 use futures::stream::{self, Stream, StreamExt};
 use std::{io::Cursor, num::NonZeroUsize};
 use tracing::{trace, warn};
-use zstd::{bulk::compress, decode_all};
+use crate::journal::decompress::decode_frame;
+use zstd::bulk::compress;
 
 /// Configuration for `Journal` storage.
 #[derive(Clone)]
@@ -190,8 +191,16 @@ struct ReplayState<B: Blob, C> {
 /// Decode item data with optional decompression.
 fn decode_item<V: Codec>(item_data: impl Buf, cfg: &V::Cfg, compressed: bool) -> Result<V, Error> {
     if compressed {
-        let decompressed =
-            decode_all(item_data.reader()).map_err(|_| Error::DecompressionFailed)?;
+        // Avoid a copy when the item is already contiguous (the common case);
+        // only fall back to gathering when the Buf is fragmented.
+        let decompressed = if item_data.chunk().len() == item_data.remaining() {
+            decode_frame(item_data.chunk()).map_err(|_| Error::DecompressionFailed)?
+        } else {
+            let mut raw = Vec::with_capacity(item_data.remaining());
+            std::io::Read::read_to_end(&mut item_data.reader(), &mut raw)
+                .map_err(|_| Error::DecompressionFailed)?;
+            decode_frame(&raw).map_err(|_| Error::DecompressionFailed)?
+        };
         V::decode_cfg(decompressed.as_ref(), cfg).map_err(Error::Codec)
     } else {
         V::decode_cfg(item_data, cfg).map_err(Error::Codec)
