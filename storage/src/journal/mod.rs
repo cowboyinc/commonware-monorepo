@@ -43,6 +43,18 @@ pub(crate) mod decompress {
         // allocation. Above the cap, fall back to streaming, which grows
         // incrementally instead of allocating up front.
         const MAX_PLEDGED_BYTES: u64 = 256 * 1024 * 1024;
+        // `get_frame_content_size` reports the size of the FIRST frame only, and
+        // `Decompressor::decompress` decodes exactly one frame -- but `decode_all`
+        // (which this replaces) consumes EVERY concatenated frame in the input.
+        // Taking the single-frame path on a multi-frame blob therefore returns a
+        // silently TRUNCATED value: measured 39 bytes of payload returned as 19,
+        // with no error. That corrupts state fast-sync (`RootUnproven`). Only take
+        // the fast path when the first frame spans the whole input; otherwise fall
+        // back to `decode_all`, which handles the general case.
+        match zstd::zstd_safe::find_frame_compressed_size(src) {
+            Ok(n) if n == src.len() => {}
+            _ => return zstd::decode_all(src),
+        }
         let pledged = zstd::zstd_safe::get_frame_content_size(src)
             .ok()
             .flatten()
@@ -60,6 +72,40 @@ pub(crate) mod decompress {
                 .expect("initialized above")
                 .decompress(src, capacity)
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::decode_frame;
+
+        /// Regression: `get_frame_content_size` reports only the FIRST frame and
+        /// `Decompressor::decompress` decodes only one, while the `decode_all` this
+        /// replaced consumes every concatenated frame. The fast path therefore
+        /// returned a silently TRUNCATED value (39 bytes of payload as 19), which
+        /// corrupted state fast-sync with `RootUnproven`.
+        #[test]
+        fn matches_decode_all_on_concatenated_frames() {
+            let a = zstd::bulk::compress(b"first-frame-payload", 3).unwrap();
+            let b = zstd::bulk::compress(b"second-frame-payload", 3).unwrap();
+            let mut joined = a.clone();
+            joined.extend_from_slice(&b);
+
+            assert_eq!(decode_frame(&a).unwrap(), zstd::decode_all(&a[..]).unwrap());
+
+            let got = decode_frame(&joined).unwrap();
+            let want = zstd::decode_all(&joined[..]).unwrap();
+            assert_eq!(got, want, "truncated: {} bytes vs {}", got.len(), want.len());
+            assert_eq!(want, b"first-frame-payloadsecond-frame-payload");
+        }
+
+        /// Empty and single-frame inputs must still round-trip.
+        #[test]
+        fn round_trips_single_frames() {
+            for payload in [b"".as_slice(), b"x".as_slice(), &vec![7u8; 100_000]] {
+                let c = zstd::bulk::compress(payload, 3).unwrap();
+                assert_eq!(decode_frame(&c).unwrap(), payload);
+            }
+        }
     }
 }
 
