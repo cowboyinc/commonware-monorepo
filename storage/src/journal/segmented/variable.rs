@@ -189,12 +189,27 @@ struct ReplayState<B: Blob, C> {
 }
 
 /// Decode item data with optional decompression.
-fn decode_item<V: Codec>(item_data: impl Buf, cfg: &V::Cfg, compressed: bool) -> Result<V, Error> {
+fn decode_item<V: Codec>(
+    mut item_data: impl Buf,
+    cfg: &V::Cfg,
+    compressed: bool,
+) -> Result<V, Error> {
     if compressed {
         // Avoid a copy when the item is already contiguous (the common case);
         // only fall back to gathering when the Buf is fragmented.
+        //
+        // Replay hands us `(&mut state.replay).take(item_size)` and relies on
+        // this function CONSUMING exactly `item_size` from the shared stream
+        // (the `decode_all(reader)` this replaced did so implicitly). The
+        // contiguous path must therefore advance past the bytes it borrows,
+        // or the stream stays pointed at the item body and the next iteration
+        // parses frame-interior bytes as a length prefix.
         let decompressed = if item_data.chunk().len() == item_data.remaining() {
-            decode_frame(item_data.chunk()).map_err(|_| Error::DecompressionFailed)?
+            let decoded =
+                decode_frame(item_data.chunk()).map_err(|_| Error::DecompressionFailed)?;
+            let len = item_data.remaining();
+            item_data.advance(len);
+            decoded
         } else {
             let mut raw = Vec::with_capacity(item_data.remaining());
             std::io::Read::read_to_end(&mut item_data.reader(), &mut raw)
@@ -943,6 +958,61 @@ mod tests {
             // Check metrics
             let buffer = context.encode();
             assert!(buffer.contains("second_tracked 1"));
+        });
+    }
+
+    /// Regression: replay hands `decode_item` a `Take<&mut Replay>` and relies on
+    /// it consuming exactly the item's bytes from the shared stream. A decode path
+    /// that borrows the bytes without advancing leaves the stream pointed at the
+    /// item body, so the next iteration parses the zstd magic byte (0x28) as a
+    /// varint length and fails with `DecompressionFailed`. Multiple compressed
+    /// items in ONE section is the shape that catches it.
+    #[test_traced]
+    fn test_journal_compressed_replay_multiple_items_per_section() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = Config {
+                partition: "test-partition".into(),
+                compression: Some(3),
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                write_buffer: NZUsize!(1024),
+            };
+            let mut journal = Journal::init(context.child("first"), cfg.clone())
+                .await
+                .expect("Failed to initialize journal");
+
+            // Several items per section, across two sections.
+            let expected: Vec<(u64, i32)> = (0..10)
+                .map(|i| (if i < 6 { 1u64 } else { 2u64 }, i * 1_000_003))
+                .collect();
+            for (section, item) in &expected {
+                journal
+                    .append(*section, item)
+                    .await
+                    .expect("Failed to append data");
+            }
+            journal.sync(1).await.expect("Failed to sync journal");
+            journal.sync(2).await.expect("Failed to sync journal");
+            drop(journal);
+
+            // Restart and replay everything.
+            let journal = Journal::<_, i32>::init(context.child("second"), cfg)
+                .await
+                .expect("Failed to re-initialize journal");
+            let mut items = Vec::new();
+            let stream = journal
+                .replay(0, 0, NZUsize!(1024))
+                .await
+                .expect("unable to setup replay");
+            pin_mut!(stream);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok((section, _, _, item)) => items.push((section, item)),
+                    Err(err) => panic!("Failed to replay item: {err}"),
+                }
+            }
+            assert_eq!(items, expected);
         });
     }
 
