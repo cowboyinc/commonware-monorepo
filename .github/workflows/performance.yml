@@ -64,7 +64,7 @@ jobs:
       - name: Run setup
         uses: ./.github/actions/setup
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-10
 
       - name: Run benchmark tracking
         id: run

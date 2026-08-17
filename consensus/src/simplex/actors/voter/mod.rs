@@ -2519,9 +2519,16 @@ mod tests {
                 mailbox::new(context.child("resolver_mailbox"), NZUsize!(8));
             let (batcher_sender, mut batcher_receiver) =
                 mailbox::new(context.child("batcher_mailbox"), NZUsize!(32));
-            let (vote_sender, _) = oracle.control(me.clone()).register(0, TEST_QUOTA).await.unwrap();
-            let (certificate_sender, _) =
-                oracle.control(me.clone()).register(1, TEST_QUOTA).await.unwrap();
+            let (vote_sender, _) = oracle
+                .control(me.clone())
+                .register(0, TEST_QUOTA)
+                .await
+                .unwrap();
+            let (certificate_sender, _) = oracle
+                .control(me.clone())
+                .register(1, TEST_QUOTA)
+                .await
+                .unwrap();
             let handle = voter.start(
                 batcher::Mailbox::new(batcher_sender),
                 resolver::Mailbox::new(resolver_sender),
@@ -2574,9 +2581,16 @@ mod tests {
                 mailbox::new(context.child("resolver_mailbox"), NZUsize!(8));
             let (batcher_sender, mut batcher_receiver) =
                 mailbox::new(context.child("batcher_mailbox"), NZUsize!(32));
-            let (vote_sender, _) = oracle.control(me.clone()).register(2, TEST_QUOTA).await.unwrap();
-            let (certificate_sender, _) =
-                oracle.control(me.clone()).register(3, TEST_QUOTA).await.unwrap();
+            let (vote_sender, _) = oracle
+                .control(me.clone())
+                .register(2, TEST_QUOTA)
+                .await
+                .unwrap();
+            let (certificate_sender, _) = oracle
+                .control(me.clone())
+                .register(3, TEST_QUOTA)
+                .await
+                .unwrap();
             voter.start(
                 batcher::Mailbox::new(batcher_sender),
                 resolver::Mailbox::new(resolver_sender),
@@ -2589,9 +2603,7 @@ mod tests {
             // uninteresting.
             match batcher_receiver.recv().await.unwrap() {
                 batcher::Message::Update {
-                    current,
-                    finalized,
-                    ..
+                    current, finalized, ..
                 } => {
                     assert_eq!(current, target_view);
                     assert_eq!(finalized, target_view.previous().unwrap());

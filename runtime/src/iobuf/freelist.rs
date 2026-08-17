@@ -273,6 +273,10 @@ impl Freelist {
     /// finally dropped, otherwise the buffer leaks.
     #[inline(always)]
     pub(super) fn try_create(&self, zeroed: bool) -> Option<(u32, PooledBuffer)> {
+        // `fetch_update` is deprecated on recent nightlies in favor of
+        // `try_update`, but the replacement is not yet available on the stable
+        // toolchain the test jobs build with — keep the old name until it is.
+        #[allow(deprecated)]
         let slot = self
             .created
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |created| {
