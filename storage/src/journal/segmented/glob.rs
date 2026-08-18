@@ -27,12 +27,11 @@
 //! 5. Decode value
 
 use super::manager::{Config as ManagerConfig, Manager, WriteFactory};
-use crate::journal::Error;
+use crate::journal::{decompress::decode_frame, Error};
 use commonware_codec::{Codec, CodecShared, FixedSize};
 use commonware_cryptography::{crc32, Crc32};
 use commonware_runtime::{BufMut, BufferPooler, Error as RError, Metrics, Storage};
 use std::num::NonZeroUsize;
-use crate::journal::decompress::decode_frame;
 use zstd::bulk::compress;
 
 /// Configuration for blob storage.

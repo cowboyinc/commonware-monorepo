@@ -81,7 +81,7 @@
 //! ```
 
 use super::manager::{AppendFactory, Config as ManagerConfig, Manager};
-use crate::journal::Error;
+use crate::journal::{decompress::decode_frame, Error};
 use commonware_codec::{
     varint::{UInt, MAX_U32_VARINT_SIZE},
     Codec, CodecShared, EncodeSize, ReadExt, Write as CodecWrite,
@@ -94,18 +94,17 @@ use commonware_runtime::{
 use futures::stream::{self, Stream, StreamExt};
 use std::{io::Cursor, num::NonZeroUsize, sync::Arc};
 use tracing::{trace, warn};
-use crate::journal::decompress::decode_frame;
 use zstd::bulk::compress;
 
 /// Per-point-read timing for the two decode layers, exposed so per-read CPU can
 /// be attributed between zstd decompression and codec decode without a profiler.
 ///
-/// Timing uses the runtime [`Clock`] via [`Timed`] — the same idiom as the
-/// contiguous journal's metrics — so it works on every target the crate builds
+/// Timing uses the runtime [`Clock`] via [`Timed`] - the same idiom as the
+/// contiguous journal's metrics - so it works on every target the crate builds
 /// for (`std::time::Instant` panics on `wasm32-unknown-unknown`). Under the
 /// deterministic runtime the samples are zero-width, which is fine: only
-/// counts are asserted. The samples are observational only — no logic consults
-/// them — so determinism of behavior is unaffected. Replay is deliberately not
+/// counts are asserted. The samples are observational only; no logic consults
+/// them, so determinism of behavior is unaffected. Replay is deliberately not
 /// sampled: bulk startup decode would swamp the point-read distribution these
 /// histograms exist to expose.
 pub(crate) struct ReadMetrics {
@@ -298,7 +297,7 @@ impl<E: Storage + Clock + Metrics, V: CodecShared> Journal<E, V> {
             },
         };
         let read_metrics = Arc::new(ReadMetrics {
-                decompress: Timed::new(duration_histogram(
+            decompress: Timed::new(duration_histogram(
                 &context,
                 "read_decompress_duration",
                 "Time decompressing a single item during a point read",
@@ -678,15 +677,14 @@ impl<E: Storage + Clock + Metrics, V: CodecShared> Journal<E, V> {
             .ok_or(Error::SectionOutOfRange(section))?;
 
         // Perform a multi-op read.
-        let (_, _, item) =
-            Self::read(
-                self.compression.is_some(),
-                &self.codec_config,
-                blob,
-                offset,
-                Some((&self.read_metrics, self.manager.context())),
-            )
-            .await?;
+        let (_, _, item) = Self::read(
+            self.compression.is_some(),
+            &self.codec_config,
+            blob,
+            offset,
+            Some((&self.read_metrics, self.manager.context())),
+        )
+        .await?;
         Ok(item)
     }
 
@@ -706,8 +704,14 @@ impl<E: Storage + Clock + Metrics, V: CodecShared> Journal<E, V> {
         let cfg = &self.codec_config;
         let mut items = Vec::with_capacity(offsets.len());
         for &offset in offsets {
-            let (_, _, item) =
-                Self::read(compressed, cfg, blob, offset, Some((&self.read_metrics, self.manager.context()))).await?;
+            let (_, _, item) = Self::read(
+                compressed,
+                cfg,
+                blob,
+                offset,
+                Some((&self.read_metrics, self.manager.context())),
+            )
+            .await?;
             items.push(item);
         }
         Ok(items)
@@ -789,8 +793,14 @@ impl<E: Storage + Clock + Metrics, V: CodecShared> Journal<E, V> {
             local_offset = data_end;
         }
 
-        let (_, _, item) =
-            Self::read(compressed, cfg, blob, end, Some((&self.read_metrics, self.manager.context()))).await?;
+        let (_, _, item) = Self::read(
+            compressed,
+            cfg,
+            blob,
+            end,
+            Some((&self.read_metrics, self.manager.context())),
+        )
+        .await?;
         items.push(item);
         Ok(items)
     }

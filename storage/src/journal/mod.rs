@@ -11,7 +11,6 @@ commonware_macros::stability_mod!(ALPHA, pub mod authenticated);
 pub mod contiguous;
 pub mod segmented;
 
-
 /// Reusable zstd decompression, shared by the segmented journals.
 ///
 /// `zstd::decode_all` constructs a fresh `DCtx` on every call. Profiling a
@@ -94,7 +93,13 @@ pub(crate) mod decompress {
 
             let got = decode_frame(&joined).unwrap();
             let want = zstd::decode_all(&joined[..]).unwrap();
-            assert_eq!(got, want, "truncated: {} bytes vs {}", got.len(), want.len());
+            assert_eq!(
+                got,
+                want,
+                "truncated: {} bytes vs {}",
+                got.len(),
+                want.len()
+            );
             assert_eq!(want, b"first-frame-payloadsecond-frame-payload");
         }
 
