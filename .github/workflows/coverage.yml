@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  NIGHTLY_VERSION: nightly
+  NIGHTLY_VERSION: nightly-2026-06-21
 
 jobs:
   Coverage:
@@ -87,8 +87,12 @@ jobs:
         pattern: coverage-lcov-*
         merge-multiple: true
     - name: Upload to Codecov
-      uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5.5.1
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
       with:
         files: lcov-*.info
-        fail_ci_if_error: true
+        # Best-effort: Codecov's key endpoint has served invalid PGP data for
+        # 1h+ (uploader dies at CLI verification), and a third-party outage
+        # must not red the repo. Coverage COLLECTION is still enforced by the
+        # Coverage jobs; restore hard-fail once codecov is reliable again.
+        fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
