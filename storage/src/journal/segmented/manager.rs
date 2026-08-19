@@ -145,7 +145,7 @@ pub struct Manager<E: Storage + Metrics, F: BufferFactory<E::Blob>> {
 impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
     /// The runtime context this manager was initialized with (e.g. for the
     /// sibling journal's duration timers, which need its `Clock`).
-    pub(super) fn context(&self) -> &E {
+    pub(super) const fn context(&self) -> &E {
         &self.context
     }
 
