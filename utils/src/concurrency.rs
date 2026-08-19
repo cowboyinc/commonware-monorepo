@@ -26,8 +26,8 @@ impl Limiter {
     /// Attempt to reserve a slot. Returns `None` when the limiter is saturated.
     pub fn try_acquire(&self) -> Option<Reservation> {
         // `fetch_update` is deprecated on recent nightlies in favor of
-        // `try_update`, but the replacement is not yet available on the stable
-        // toolchain the test jobs build with — keep the old name until it is.
+        // `try_update`, but the replacement is not available on the workspace
+        // MSRV of 1.91.1. Keep the old name until it is.
         #[allow(deprecated)]
         self.current
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {

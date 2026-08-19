@@ -1836,7 +1836,6 @@ mod tests {
             let Fixture {
                 participants,
                 schemes,
-                verifier: _,
                 ..
             } = fixture(&mut context, &namespace, n);
 

@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_COOLDOWN_VERSION: 0.3.0
   UDEPS_VERSION: 0.1.57
-  NIGHTLY_VERSION: nightly-2026-08-10
+  NIGHTLY_VERSION: nightly-2026-06-21
   PANDOC_VERSION: 3.8.2.1
 
 jobs:
@@ -380,7 +380,7 @@ jobs:
         toolchain:
           - msrv
           - stable
-          - nightly-2026-08-10
+          - nightly-2026-06-21
     steps:
       - name: Checkout repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
