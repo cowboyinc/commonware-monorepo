@@ -81,19 +81,39 @@
 //! ```
 
 use super::manager::{AppendFactory, Config as ManagerConfig, Manager};
-use crate::journal::Error;
+use crate::journal::{decompress::decode_frame, Error};
 use commonware_codec::{
     varint::{UInt, MAX_U32_VARINT_SIZE},
     Codec, CodecShared, EncodeSize, ReadExt, Write as CodecWrite,
 };
 use commonware_runtime::{
     buffer::paged::{Append, CacheRef, Replay},
-    Blob, Buf, IoBuf, IoBufMut, Metrics, Storage,
+    telemetry::metrics::histogram::{duration_histogram, Timed},
+    Blob, Buf, Clock, IoBuf, IoBufMut, Metrics, Storage,
 };
 use futures::stream::{self, Stream, StreamExt};
-use std::{io::Cursor, num::NonZeroUsize};
+use std::{io::Cursor, num::NonZeroUsize, sync::Arc};
 use tracing::{trace, warn};
-use zstd::{bulk::compress, decode_all};
+use zstd::bulk::compress;
+
+/// Per-point-read timing for the two decode layers, exposed so per-read CPU can
+/// be attributed between zstd decompression and codec decode without a profiler.
+///
+/// Timing uses the runtime [`Clock`] via [`Timed`] - the same idiom as the
+/// contiguous journal's metrics - so it works on every target the crate builds
+/// for (`std::time::Instant` panics on `wasm32-unknown-unknown`). Under the
+/// deterministic runtime the samples are zero-width, which is fine: only
+/// counts are asserted. The samples are observational only; no logic consults
+/// them, so determinism of behavior is unaffected. Replay is deliberately not
+/// sampled: bulk startup decode would swamp the point-read distribution these
+/// histograms exist to expose.
+pub(crate) struct ReadMetrics {
+    /// Time spent decompressing a single item during a point read.
+    decompress: Timed,
+
+    /// Time spent codec-decoding a single item during a point read.
+    decode: Timed,
+}
 
 /// Configuration for `Journal` storage.
 #[derive(Clone)]
@@ -188,13 +208,51 @@ struct ReplayState<B: Blob, C> {
 }
 
 /// Decode item data with optional decompression.
-fn decode_item<V: Codec>(item_data: impl Buf, cfg: &V::Cfg, compressed: bool) -> Result<V, Error> {
+fn decode_item<V: Codec, C: Clock>(
+    mut item_data: impl Buf,
+    cfg: &V::Cfg,
+    compressed: bool,
+    metrics: Option<(&ReadMetrics, &C)>,
+) -> Result<V, Error> {
     if compressed {
-        let decompressed =
-            decode_all(item_data.reader()).map_err(|_| Error::DecompressionFailed)?;
-        V::decode_cfg(decompressed.as_ref(), cfg).map_err(Error::Codec)
+        // Avoid a copy when the item is already contiguous (the common case);
+        // only fall back to gathering when the Buf is fragmented.
+        //
+        // Replay hands us `(&mut state.replay).take(item_size)` and relies on
+        // this function CONSUMING exactly `item_size` from the shared stream
+        // (the `decode_all(reader)` this replaced did so implicitly). The
+        // contiguous path must therefore advance past the bytes it borrows,
+        // or the stream stays pointed at the item body and the next iteration
+        // parses frame-interior bytes as a length prefix.
+        let timer = metrics.map(|(m, c)| m.decompress.timer(c));
+        let decompressed = if item_data.chunk().len() == item_data.remaining() {
+            let decoded =
+                decode_frame(item_data.chunk()).map_err(|_| Error::DecompressionFailed)?;
+            let len = item_data.remaining();
+            item_data.advance(len);
+            decoded
+        } else {
+            let mut raw = Vec::with_capacity(item_data.remaining());
+            std::io::Read::read_to_end(&mut item_data.reader(), &mut raw)
+                .map_err(|_| Error::DecompressionFailed)?;
+            decode_frame(&raw).map_err(|_| Error::DecompressionFailed)?
+        };
+        if let (Some((_, c)), Some(t)) = (metrics, timer) {
+            t.observe(c);
+        }
+        let timer = metrics.map(|(m, c)| m.decode.timer(c));
+        let decoded = V::decode_cfg(decompressed.as_ref(), cfg).map_err(Error::Codec);
+        if let (Some((_, c)), Some(t)) = (metrics, timer) {
+            t.observe(c);
+        }
+        decoded
     } else {
-        V::decode_cfg(item_data, cfg).map_err(Error::Codec)
+        let timer = metrics.map(|(m, c)| m.decode.timer(c));
+        let decoded = V::decode_cfg(item_data, cfg).map_err(Error::Codec);
+        if let (Some((_, c)), Some(t)) = (metrics, timer) {
+            t.observe(c);
+        }
+        decoded
     }
 }
 
@@ -211,7 +269,7 @@ fn decode_item<V: Codec>(item_data: impl Buf, cfg: &V::Cfg, compressed: bool) ->
 /// the first invalid data read will be considered the new end of the journal (and the
 /// underlying [Blob] will be truncated to the last valid item). Repair occurs during
 /// replay (not init) because any blob could have trailing bytes.
-pub struct Journal<E: Storage + Metrics, V: Codec> {
+pub struct Journal<E: Storage + Clock + Metrics, V: Codec> {
     manager: Manager<E, AppendFactory>,
 
     /// Compression level (if enabled).
@@ -219,9 +277,12 @@ pub struct Journal<E: Storage + Metrics, V: Codec> {
 
     /// Codec configuration.
     codec_config: V::Cfg,
+
+    /// Point-read decode timing.
+    read_metrics: Arc<ReadMetrics>,
 }
 
-impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
+impl<E: Storage + Clock + Metrics, V: CodecShared> Journal<E, V> {
     /// Initialize a new `Journal` instance.
     ///
     /// All backing blobs are opened but not read during
@@ -235,12 +296,25 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
                 page_cache_ref: cfg.page_cache,
             },
         };
+        let read_metrics = Arc::new(ReadMetrics {
+            decompress: Timed::new(duration_histogram(
+                &context,
+                "read_decompress_duration",
+                "Time decompressing a single item during a point read",
+            )),
+            decode: Timed::new(duration_histogram(
+                &context,
+                "read_decode_duration",
+                "Time codec-decoding a single item during a point read",
+            )),
+        });
         let manager = Manager::init(context, manager_cfg).await?;
 
         Ok(Self {
             manager,
             compression: cfg.compression,
             codec_config: cfg.codec_config,
+            read_metrics,
         })
     }
 
@@ -250,6 +324,7 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
         cfg: &V::Cfg,
         blob: &Append<E::Blob>,
         offset: u64,
+        metrics: Option<(&ReadMetrics, &E)>,
     ) -> Result<(u64, u32, V), Error> {
         // Read varint header (max 5 bytes for u32)
         let (buf, available) = blob
@@ -271,7 +346,7 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
             } => {
                 // Data follows varint in buffer
                 let data = buf.slice(varint_len..varint_len + data_len);
-                let decoded = decode_item::<V>(data, cfg, compressed)?;
+                let decoded = decode_item::<V, _>(data, cfg, compressed, metrics)?;
                 (data_len as u32, decoded)
             }
             ItemInfo::Incomplete {
@@ -286,7 +361,7 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
                 let mut remainder = vec![0u8; remainder_len];
                 blob.read_into(&mut remainder, read_offset).await?;
                 let chained = prefix.chain(IoBuf::from(remainder));
-                let decoded = decode_item::<V>(chained, cfg, compressed)?;
+                let decoded = decode_item::<V, _>(chained, cfg, compressed, metrics)?;
                 (total_len as u32, decoded)
             }
         };
@@ -467,10 +542,11 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
                                     return Some((batch, state));
                                 }
                             };
-                            match decode_item::<V>(
+                            match decode_item::<V, _>(
                                 (&mut state.replay).take(item_size),
                                 &state.codec_config,
                                 state.compressed,
+                                None::<(&ReadMetrics, &E)>,
                             ) {
                                 Ok(decoded) => {
                                     batch.push(Ok((
@@ -601,8 +677,14 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
             .ok_or(Error::SectionOutOfRange(section))?;
 
         // Perform a multi-op read.
-        let (_, _, item) =
-            Self::read(self.compression.is_some(), &self.codec_config, blob, offset).await?;
+        let (_, _, item) = Self::read(
+            self.compression.is_some(),
+            &self.codec_config,
+            blob,
+            offset,
+            Some((&self.read_metrics, self.manager.context())),
+        )
+        .await?;
         Ok(item)
     }
 
@@ -622,7 +704,14 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
         let cfg = &self.codec_config;
         let mut items = Vec::with_capacity(offsets.len());
         for &offset in offsets {
-            let (_, _, item) = Self::read(compressed, cfg, blob, offset).await?;
+            let (_, _, item) = Self::read(
+                compressed,
+                cfg,
+                blob,
+                offset,
+                Some((&self.read_metrics, self.manager.context())),
+            )
+            .await?;
             items.push(item);
         }
         Ok(items)
@@ -694,16 +783,24 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
                 .checked_add(item_len)
                 .ok_or(Error::OffsetOverflow)?;
 
-            items.push(decode_item::<V>(
+            items.push(decode_item::<V, _>(
                 &bytes[data_start..data_end],
                 cfg,
                 compressed,
+                Some((&self.read_metrics, self.manager.context())),
             )?);
 
             local_offset = data_end;
         }
 
-        let (_, _, item) = Self::read(compressed, cfg, blob, end).await?;
+        let (_, _, item) = Self::read(
+            compressed,
+            cfg,
+            blob,
+            end,
+            Some((&self.read_metrics, self.manager.context())),
+        )
+        .await?;
         items.push(item);
         Ok(items)
     }
@@ -749,10 +846,11 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
 
         // If the full item fits in the header read, decode directly.
         if item_len <= header_len {
-            return decode_item::<V>(
+            return decode_item::<V, _>(
                 &header[varint_len..varint_len + data_len],
                 &self.codec_config,
                 self.compression.is_some(),
+                Some((&self.read_metrics, self.manager.context())),
             )
             .ok();
         }
@@ -762,10 +860,11 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
         if !blob.try_read_sync(offset, buf) {
             return None;
         }
-        decode_item::<V>(
+        decode_item::<V, _>(
             &buf[varint_len..varint_len + data_len],
             &self.codec_config,
             self.compression.is_some(),
+            Some((&self.read_metrics, self.manager.context())),
         )
         .ok()
     }
@@ -934,6 +1033,77 @@ mod tests {
             // Check metrics
             let buffer = context.encode();
             assert!(buffer.contains("second_tracked 1"));
+        });
+    }
+
+    /// Regression: replay hands `decode_item` a `Take<&mut Replay>` and relies on
+    /// it consuming exactly the item's bytes from the shared stream. A decode path
+    /// that borrows the bytes without advancing leaves the stream pointed at the
+    /// item body, so the next iteration parses the zstd magic byte (0x28) as a
+    /// varint length and fails with `DecompressionFailed`. Multiple compressed
+    /// items in ONE section is the shape that catches it.
+    #[test_traced]
+    fn test_journal_compressed_replay_multiple_items_per_section() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = Config {
+                partition: "test-partition".into(),
+                compression: Some(3),
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                write_buffer: NZUsize!(1024),
+            };
+            let mut journal = Journal::init(context.child("first"), cfg.clone())
+                .await
+                .expect("Failed to initialize journal");
+
+            // Several items per section, across two sections.
+            let expected: Vec<(u64, i32)> = (0..10)
+                .map(|i| (if i < 6 { 1u64 } else { 2u64 }, i * 1_000_003))
+                .collect();
+            for (section, item) in &expected {
+                journal
+                    .append(*section, item)
+                    .await
+                    .expect("Failed to append data");
+            }
+            journal.sync(1).await.expect("Failed to sync journal");
+            journal.sync(2).await.expect("Failed to sync journal");
+            drop(journal);
+
+            // Restart and replay everything.
+            let journal = Journal::<_, i32>::init(context.child("second"), cfg)
+                .await
+                .expect("Failed to re-initialize journal");
+            let mut items = Vec::new();
+            let mut first_offset = None;
+            let stream = journal
+                .replay(0, 0, NZUsize!(1024))
+                .await
+                .expect("unable to setup replay");
+            pin_mut!(stream);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok((section, offset, _, item)) => {
+                        first_offset.get_or_insert((section, offset));
+                        items.push((section, item));
+                    }
+                    Err(err) => panic!("Failed to replay item: {err}"),
+                }
+            }
+            assert_eq!(items, expected);
+
+            // Replay must not record point-read decode timing.
+            let buffer = context.encode();
+            assert!(buffer.contains("second_read_decompress_duration_count 0"));
+
+            // A point read records one decompress and one decode sample.
+            let (section, offset) = first_offset.expect("replayed at least one item");
+            let got = journal.get(section, offset).await.expect("get failed");
+            assert_eq!(got, expected[0].1);
+            let buffer = context.encode();
+            assert!(buffer.contains("second_read_decompress_duration_count 1"));
+            assert!(buffer.contains("second_read_decode_duration_count 1"));
         });
     }
 

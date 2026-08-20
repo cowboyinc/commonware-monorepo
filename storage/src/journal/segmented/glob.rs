@@ -27,12 +27,12 @@
 //! 5. Decode value
 
 use super::manager::{Config as ManagerConfig, Manager, WriteFactory};
-use crate::journal::Error;
+use crate::journal::{decompress::decode_frame, Error};
 use commonware_codec::{Codec, CodecShared, FixedSize};
 use commonware_cryptography::{crc32, Crc32};
 use commonware_runtime::{BufMut, BufferPooler, Error as RError, Metrics, Storage};
-use std::{io::Cursor, num::NonZeroUsize};
-use zstd::{bulk::compress, decode_all};
+use std::num::NonZeroUsize;
+use zstd::bulk::compress;
 
 /// Configuration for blob storage.
 #[derive(Clone)]
@@ -153,7 +153,7 @@ impl<E: BufferPooler + Storage + Metrics, V: CodecShared> Glob<E, V> {
         // Decompress if needed and decode
         let value = if self.compression.is_some() {
             let decompressed =
-                decode_all(Cursor::new(compressed_data)).map_err(|_| Error::DecompressionFailed)?;
+                decode_frame(compressed_data).map_err(|_| Error::DecompressionFailed)?;
             V::decode_cfg(decompressed.as_ref(), &self.codec_config).map_err(Error::Codec)?
         } else {
             V::decode_cfg(compressed_data, &self.codec_config).map_err(Error::Codec)?

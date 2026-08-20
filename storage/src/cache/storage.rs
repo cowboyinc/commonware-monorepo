@@ -6,7 +6,7 @@ use crate::{
 use commonware_codec::{varint::UInt, CodecShared, EncodeSize, Read, ReadExt, Write};
 use commonware_runtime::{
     telemetry::metrics::{Counter, Gauge, GaugeExt, MetricsExt as _},
-    Buf, BufMut, Metrics, Storage,
+    Buf, BufMut, Clock, Metrics, Storage,
 };
 use futures::{future::try_join_all, pin_mut, StreamExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,7 +59,7 @@ where
 }
 
 /// Implementation of `Cache` storage.
-pub struct Cache<E: Storage + Metrics, V: CodecShared> {
+pub struct Cache<E: Storage + Clock + Metrics, V: CodecShared> {
     items_per_blob: u64,
     journal: Journal<E, Record<V>>,
     pending: BTreeSet<u64>,
@@ -75,7 +75,7 @@ pub struct Cache<E: Storage + Metrics, V: CodecShared> {
     syncs: Counter,
 }
 
-impl<E: Storage + Metrics, V: CodecShared> Cache<E, V> {
+impl<E: Storage + Clock + Metrics, V: CodecShared> Cache<E, V> {
     /// Calculate the section for a given index.
     const fn section(&self, index: u64) -> u64 {
         (index / self.items_per_blob) * self.items_per_blob
