@@ -57,9 +57,15 @@ default-features = false
 features = ["alloc"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
-# Enable "js" feature when WASM is target
+# COWBOY FORK: the wasm32 RNG backend is `custom`, not `js`. The cowboy
+# protocol wasm artifacts register a host-free custom getrandom handler
+# (`cowboy-protocol-wasm-ffi`) and forbid a JS import surface; cargo unifies
+# getrandom's features across one wasm32 resolution, so a forced `js` here
+# overrode that stub and broke the "getrandom/js stays opt-in" gate. `custom`
+# satisfies the same link requirement without pulling a JS backend. Upstream
+# consumers that want the JS backend enable `getrandom/js` themselves.
 version = "0.2.15"
-features = ["js"]
+features = ["custom"]
 
 [dev-dependencies]
 anyhow.workspace = true
