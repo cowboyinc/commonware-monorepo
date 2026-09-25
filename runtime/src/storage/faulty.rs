@@ -21,6 +21,7 @@ enum Op {
     Sync,
     Resize,
     Remove,
+    BlobLen,
     Scan,
 }
 
@@ -59,6 +60,9 @@ pub struct Config {
     /// Failure rate for `remove` operations.
     pub remove_rate: Option<f64>,
 
+    /// Failure rate for `blob_len` operations.
+    pub blob_len_rate: Option<f64>,
+
     /// Failure rate for `scan` operations.
     pub scan_rate: Option<f64>,
 }
@@ -73,6 +77,7 @@ impl Config {
             Op::Sync => self.sync_rate,
             Op::Resize => self.resize_rate,
             Op::Remove => self.remove_rate,
+            Op::BlobLen => self.blob_len_rate,
             Op::Scan => self.scan_rate,
         }
         .unwrap_or(0.0)
@@ -123,6 +128,12 @@ impl Config {
     /// Set the remove failure rate.
     pub const fn remove(mut self, rate: f64) -> Self {
         self.remove_rate = Some(rate);
+        self
+    }
+
+    /// Set the blob-length failure rate.
+    pub const fn blob_len(mut self, rate: f64) -> Self {
+        self.blob_len_rate = Some(rate);
         self
     }
 
@@ -256,6 +267,13 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
             return Err(Error::Io(injected_io_error()));
         }
         self.inner.remove(partition, name).await
+    }
+
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
+        if self.ctx.should_fail(Op::BlobLen) {
+            return Err(Error::Io(injected_io_error()));
+        }
+        self.inner.blob_len(partition, name).await
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
@@ -566,6 +584,26 @@ mod tests {
             h.storage.scan("partition").await,
             Err(Error::Io(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_faulty_storage_blob_len_always_fails_without_opening() {
+        let h = Harness::new(Config::default().blob_len(1.0));
+
+        assert!(matches!(
+            h.storage.blob_len("partition", b"missing").await,
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            h.inner.blob_len("partition", b"missing").await.unwrap(),
+            None
+        );
+
+        h.config.write().blob_len_rate = Some(0.0);
+        assert_eq!(
+            h.storage.blob_len("partition", b"missing").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

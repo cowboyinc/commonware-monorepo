@@ -1558,6 +1558,10 @@ impl crate::Storage for Context {
         self.storage.remove(partition, name).await
     }
 
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
+        self.storage.blob_len(partition, name).await
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         self.storage.scan(partition).await
     }
@@ -1717,6 +1721,32 @@ mod tests {
             ..Config::default()
         };
         deterministic::Runner::new(cfg);
+    }
+
+    #[test]
+    fn test_blob_len_context_survives_recovery() {
+        let (_, checkpoint) =
+            deterministic::Runner::default().start_and_recover(|context| async move {
+                assert_eq!(context.blob_len("partition", b"blob").await.unwrap(), None);
+
+                let (blob, _) = context.open("partition", b"blob").await.unwrap();
+                assert_eq!(
+                    context.blob_len("partition", b"blob").await.unwrap(),
+                    Some(8)
+                );
+                blob.write_at_sync(0, b"data").await.unwrap();
+                assert_eq!(
+                    context.blob_len("partition", b"blob").await.unwrap(),
+                    Some(12)
+                );
+            });
+
+        Runner::from(checkpoint).start(|context| async move {
+            assert_eq!(
+                context.blob_len("partition", b"blob").await.unwrap(),
+                Some(12)
+            );
+        });
     }
 
     #[test]

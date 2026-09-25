@@ -220,6 +220,20 @@ impl crate::Storage for Storage {
         Ok(())
     }
 
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
+        super::validate_partition_name(partition)?;
+
+        // Stat only this canonical blob path. In particular, do not acquire the
+        // filesystem lock held across a full partition scan.
+        let path = self.cfg.storage_directory.join(partition).join(hex(name));
+        match fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+            Ok(_) => Err(Error::PartitionCorrupt(partition.into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::BlobOpenFailed(partition.into(), hex(name), error)),
+        }
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
 
@@ -275,6 +289,78 @@ mod tests {
         let config = Config::new(storage_directory, 2 * 1024 * 1024);
         let storage = Storage::new(config, test_pool());
         run_storage_tests(storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_len_does_not_repair_short_header_or_open_non_file() {
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_stat_{}", rand::random::<u64>()));
+        let storage = Storage::new(
+            Config::new(storage_directory.clone(), 2 * 1024 * 1024),
+            test_pool(),
+        );
+        let partition = storage_directory.join("partition");
+
+        assert_eq!(storage.blob_len("partition", b"zero").await.unwrap(), None);
+        assert!(!partition.exists(), "stat must not create a partition");
+        std::fs::create_dir_all(&partition).unwrap();
+        let zero = partition.join(hex(b"zero"));
+        let short = partition.join(hex(b"short"));
+        let non_file = partition.join(hex(b"directory"));
+        std::fs::write(&zero, []).unwrap();
+        std::fs::write(&short, [0u8; 4]).unwrap();
+        std::fs::create_dir(&non_file).unwrap();
+
+        assert_eq!(
+            storage.blob_len("partition", b"zero").await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            storage.blob_len("partition", b"short").await.unwrap(),
+            Some(4)
+        );
+        assert!(matches!(
+            storage.blob_len("partition", b"directory").await,
+            Err(Error::PartitionCorrupt(_))
+        ));
+        assert_eq!(std::fs::metadata(zero).unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(short).unwrap().len(), 4);
+        #[cfg(unix)]
+        {
+            let external = storage_directory.join("external");
+            std::fs::write(&external, [7u8; 13]).unwrap();
+            std::os::unix::fs::symlink(&external, partition.join(hex(b"symlink"))).unwrap();
+            assert!(matches!(
+                storage.blob_len("partition", b"symlink").await,
+                Err(Error::PartitionCorrupt(_))
+            ));
+            assert_eq!(std::fs::metadata(external).unwrap().len(), 13);
+        }
+        let _ = std::fs::remove_dir_all(storage_directory);
+    }
+
+    #[tokio::test]
+    async fn test_blob_len_does_not_wait_for_partition_scan_lock() {
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_stat_lock_{}", rand::random::<u64>()));
+        let storage = Storage::new(
+            Config::new(storage_directory.clone(), 2 * 1024 * 1024),
+            test_pool(),
+        );
+        storage.open("partition", b"blob").await.unwrap();
+
+        let guard = storage.lock.lock().await;
+        let length = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            storage.blob_len("partition", b"blob"),
+        )
+        .await
+        .expect("single-blob stat must not wait for a full partition scan")
+        .unwrap();
+        assert_eq!(length, Some(Header::SIZE_U64));
+        drop(guard);
+
+        let _ = std::fs::remove_dir_all(storage_directory);
     }
 
     #[tokio::test]

@@ -828,6 +828,10 @@ impl crate::Storage for Context {
         self.storage.remove(partition, name).await
     }
 
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
+        self.storage.blob_len(partition, name).await
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         self.storage.scan(partition).await
     }

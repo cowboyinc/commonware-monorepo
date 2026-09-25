@@ -61,6 +61,14 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
         self.inner.remove(partition, name).await
     }
 
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
+        self.auditor.event(b"blob_len", |hasher| {
+            hasher.update(partition.as_bytes());
+            hasher.update(name);
+        });
+        self.inner.blob_len(partition, name).await
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         self.auditor.event(b"scan", |hasher| {
             hasher.update(partition.as_bytes());
@@ -238,6 +246,19 @@ mod tests {
             auditor2.state(),
             "Hashes do not match after sync"
         );
+
+        // A read-only length observation participates in replay auditing.
+        let state_before_stat = auditor1.state();
+        assert_eq!(
+            storage1.blob_len("partition", b"test_blob").await.unwrap(),
+            Some(13)
+        );
+        assert_eq!(
+            storage2.blob_len("partition", b"test_blob").await.unwrap(),
+            Some(13)
+        );
+        assert_ne!(auditor1.state(), state_before_stat);
+        assert_eq!(auditor1.state(), auditor2.state());
 
         // Drop the blobs
         drop(blob1);

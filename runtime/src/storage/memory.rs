@@ -104,6 +104,16 @@ impl crate::Storage for Storage {
         Ok(())
     }
 
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, crate::Error> {
+        super::validate_partition_name(partition)?;
+
+        let partitions = self.partitions.lock();
+        Ok(partitions
+            .get(partition)
+            .and_then(|blobs| blobs.get(name))
+            .map(|content| content.len() as u64))
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, crate::Error> {
         super::validate_partition_name(partition)?;
 
@@ -260,6 +270,31 @@ mod tests {
     async fn test_memory_storage() {
         let storage = Storage::new(test_pool());
         run_storage_tests(storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_len_does_not_repair_short_header() {
+        let storage = Storage::new(test_pool());
+        {
+            let mut partitions = storage.partitions.lock();
+            let partition = partitions.entry("partition".into()).or_default();
+            partition.insert(b"zero".to_vec(), vec![]);
+            partition.insert(b"short".to_vec(), vec![0u8; 4]);
+        }
+
+        assert_eq!(
+            storage.blob_len("partition", b"zero").await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            storage.blob_len("partition", b"short").await.unwrap(),
+            Some(4)
+        );
+
+        let partitions = storage.partitions.lock();
+        let partition = partitions.get("partition").unwrap();
+        assert!(partition.get(b"zero".as_slice()).unwrap().is_empty());
+        assert_eq!(partition.get(b"short".as_slice()).unwrap().len(), 4);
     }
 
     #[tokio::test]
