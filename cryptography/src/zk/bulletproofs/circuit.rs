@@ -1604,7 +1604,9 @@ pub mod fuzz {
                 ipa::Setup::new(
                     generators[0],
                     generators[1..3]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|chunk| (chunk[0], chunk[1])),
                 ),
                 generators[3],
