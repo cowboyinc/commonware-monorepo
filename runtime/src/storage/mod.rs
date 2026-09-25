@@ -284,6 +284,7 @@ pub(crate) mod tests {
         S::Blob: Send + Sync,
     {
         test_open_and_write(&storage).await;
+        test_blob_len(&storage).await;
         test_remove(&storage).await;
         test_scan(&storage).await;
         test_concurrent_access(&storage).await;
@@ -325,6 +326,48 @@ pub(crate) mod tests {
             b"hello world",
             "Blob content does not match expected value"
         );
+    }
+
+    /// A size probe must not create storage and must include the physical header.
+    async fn test_blob_len<S>(storage: &S)
+    where
+        S: Storage + Send + Sync,
+        S::Blob: Send + Sync,
+    {
+        const PARTITION: &str = "test_blob_len";
+        const NAME: &[u8] = b"blob";
+
+        assert_eq!(storage.blob_len(PARTITION, NAME).await.unwrap(), None);
+        assert!(matches!(
+            storage.scan(PARTITION).await,
+            Err(crate::Error::PartitionMissing(_))
+        ));
+
+        let (blob, logical_len) = storage.open(PARTITION, NAME).await.unwrap();
+        assert_eq!(logical_len, 0);
+        assert_eq!(
+            storage.blob_len(PARTITION, NAME).await.unwrap(),
+            Some(Header::SIZE_U64)
+        );
+        assert_eq!(storage.blob_len(PARTITION, b"missing").await.unwrap(), None);
+
+        blob.write_at_sync(0, b"hello").await.unwrap();
+        assert_eq!(
+            storage.blob_len(PARTITION, NAME).await.unwrap(),
+            Some(Header::SIZE_U64 + 5)
+        );
+
+        blob.resize(2).await.unwrap();
+        blob.sync().await.unwrap();
+        assert_eq!(
+            storage.blob_len(PARTITION, NAME).await.unwrap(),
+            Some(Header::SIZE_U64 + 2)
+        );
+
+        storage.remove(PARTITION, Some(NAME)).await.unwrap();
+        assert_eq!(storage.blob_len(PARTITION, NAME).await.unwrap(), None);
+        storage.remove(PARTITION, None).await.unwrap();
+        assert_eq!(storage.blob_len(PARTITION, NAME).await.unwrap(), None);
     }
 
     /// Test removing a blob from storage.
@@ -819,6 +862,13 @@ pub(crate) mod tests {
                 ),
                 "Valid partition name '{valid}' should be accepted by scan"
             );
+            assert!(
+                !matches!(
+                    storage.blob_len(valid, b"blob").await,
+                    Err(crate::Error::PartitionNameInvalid(_))
+                ),
+                "Valid partition name '{valid}' should be accepted by blob_len"
+            );
         }
 
         // Invalid partition names should return PartitionNameInvalid
@@ -849,6 +899,13 @@ pub(crate) mod tests {
                     Err(crate::Error::PartitionNameInvalid(_))
                 ),
                 "Invalid partition name '{invalid}' should be rejected by scan"
+            );
+            assert!(
+                matches!(
+                    storage.blob_len(invalid, b"blob").await,
+                    Err(crate::Error::PartitionNameInvalid(_))
+                ),
+                "Invalid partition name '{invalid}' should be rejected by blob_len"
             );
         }
     }

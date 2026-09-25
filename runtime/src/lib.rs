@@ -713,6 +713,20 @@ stability_scope!(BETA {
             name: Option<&[u8]>,
         ) -> impl Future<Output = Result<(), Error>> + Send;
 
+        /// Return the physical size of an existing blob, including its header.
+        ///
+        /// Returns `None` when the partition or blob is absent. This read-only
+        /// operation does not create a missing blob or repair an invalid header.
+        /// Implementations must inspect only the named blob, without enumerating
+        /// its partition, so lookup cost is not linear in partition size.
+        /// The returned length is a point-in-time observation and may change if
+        /// another task writes or removes the blob concurrently.
+        fn blob_len(
+            &self,
+            partition: &str,
+            name: &[u8],
+        ) -> impl Future<Output = Result<Option<u64>, Error>> + Send;
+
         /// Return all blobs in a given partition.
         fn scan(&self, partition: &str)
             -> impl Future<Output = Result<Vec<Vec<u8>>, Error>> + Send;

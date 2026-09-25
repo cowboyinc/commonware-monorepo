@@ -95,6 +95,10 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
         self.inner.remove(partition, name).await
     }
 
+    async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
+        self.inner.blob_len(partition, name).await
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         self.inner.scan(partition).await
     }
@@ -197,6 +201,8 @@ mod tests {
         let inner = MemoryStorage::new(test_pool(&mut registry.sub_registry("pool")));
         let storage = Storage::new(inner, &mut registry.sub_registry("storage"));
 
+        assert_eq!(storage.blob_len("missing", b"blob").await.unwrap(), None);
+        assert_eq!(storage.metrics.open_blobs.get(), 0);
         run_storage_tests(storage).await;
     }
 
