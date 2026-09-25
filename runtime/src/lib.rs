@@ -721,6 +721,8 @@ stability_scope!(BETA {
         /// its partition, so lookup cost is not linear in partition size.
         /// The returned length is a point-in-time observation and may change if
         /// another task writes or removes the blob concurrently.
+        /// An open blob's unsynced writes or resizes are not guaranteed to be
+        /// reflected. Call [`Blob::sync`] before using this to observe them.
         fn blob_len(
             &self,
             partition: &str,

@@ -309,13 +309,14 @@ impl Handle {
     ///
     /// On success, this publishes one submission and conditionally wakes the
     /// loop if a futex or eventfd wait target is currently armed.
-    async fn enqueue(&self, request: Request) -> Result<(), mpsc::error::SendError<Request>> {
+    async fn enqueue(&self, request: Request) -> Result<(), Box<mpsc::error::SendError<Request>>> {
         self.inner
             .sender
             .as_ref()
             .expect("handle sender is only taken on drop")
             .send(request)
-            .await?;
+            .await
+            .map_err(Box::new)?;
 
         // Publish submission and wake the armed wait target, if any.
         self.inner.waker.publish();
