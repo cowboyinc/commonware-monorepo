@@ -56,8 +56,10 @@ impl crate::Storage for Storage {
         let content = partition_entry.entry(name.into()).or_default();
 
         let raw_len = content.len() as u64;
-        let (blob_version, logical_len) = if Header::missing(raw_len) {
-            // New or corrupted blob - truncate and write default header with latest version
+        let torn = !Header::missing(raw_len)
+            && Header::torn(raw_len, content[..Header::SIZE].try_into().unwrap());
+        let (blob_version, logical_len) = if Header::missing(raw_len) || torn {
+            // New, corrupted, or torn blob - truncate and write default header with latest version
             let (header, blob_version) = Header::new(&versions);
             content.clear();
             content.extend_from_slice(&header.encode());
@@ -368,7 +370,7 @@ mod tests {
         {
             let mut partitions = storage.partitions.lock();
             let partition = partitions.entry("partition".into()).or_default();
-            partition.insert(b"bad_magic".to_vec(), vec![0u8; Header::SIZE]);
+            partition.insert(b"bad_magic".to_vec(), b"XXXX\0\0\0\0".to_vec());
         }
 
         // Opening should fail with corrupt error
