@@ -97,6 +97,14 @@ stability_scope!(BETA {
             raw_len < Self::SIZE_U64
         }
 
+        /// Returns true if a blob is exactly one all-zero header: the state left by a
+        /// creation that extended the file to [Header::SIZE] (`set_len`) and was interrupted
+        /// before the header bytes landed. Such a blob holds no data, so it can be recreated
+        /// without loss. A longer blob holds data and is never treated as torn.
+        pub(crate) fn torn(raw_len: u64, raw_bytes: &[u8; Self::SIZE]) -> bool {
+            raw_len == Self::SIZE_U64 && *raw_bytes == [0u8; Self::SIZE]
+        }
+
         /// Creates a header for a new blob using the latest version from the range.
         /// Returns (header, blob_version).
         pub(crate) const fn new(versions: &std::ops::RangeInclusive<u16>) -> (Self, u16) {
