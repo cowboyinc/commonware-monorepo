@@ -1408,11 +1408,14 @@ mod tests {
             }
             journal.sync().await.unwrap();
 
-            // Start deleting sections 0..9, then drop the batch while it is unlinking.
+            // Start deleting sections 0..9, then drop the batch while it is unlinking. The
+            // default tokio storage unlinks on a blocking thread, so the first poll suspends.
+            // io_uring storage (`commonware-runtime/iouring-storage`) unlinks inline, so the
+            // batch may already be done; the clear below must hold either way.
             let (_, pending) = journal.prune_deferred(95).await.unwrap();
             assert_eq!(pending.blobs(), 9);
             let mut run = pending.run().boxed();
-            assert!(run.as_mut().now_or_never().is_none());
+            let _ = run.as_mut().now_or_never();
             drop(run);
 
             // Clearing deletes every released section, not just the retained ones, and the
