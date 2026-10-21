@@ -47,7 +47,12 @@
 //! # Pruning
 //!
 //! The `prune` method allows the `Journal` to prune blobs consisting entirely of items prior to a
-//! given point in history.
+//! given point in history. `prune_deferred` does the same but leaves deleting the pruned blobs to
+//! the returned [PendingDeletes], so a caller can delete them after releasing its own locks.
+//!
+//! Either way the new prune floor (the first retained section) is persisted in the metadata before
+//! any blob is released, and `init` deletes any blob found below it. A crash that leaves some
+//! pruned blobs on disk therefore never brings their items back.
 //!
 //! # Replay
 //!
@@ -59,7 +64,7 @@ use crate::{
     journal::{
         contiguous::{metrics::FixedMetrics as Metrics, Many, Mutable},
         segmented::fixed::{Config as SegmentedConfig, Journal as SegmentedJournal},
-        Error,
+        Error, PendingDeletes,
     },
     metadata::{Config as MetadataConfig, Metadata},
     Context, Persistable,
@@ -73,6 +78,24 @@ use tracing::warn;
 
 /// Metadata key for storing the pruning boundary.
 const PRUNING_BOUNDARY_KEY: u64 = 1;
+
+/// Metadata key for the prune floor: every section below it has been pruned, though its blob may
+/// still exist if its deferred deletion had not run before a restart.
+const PRUNED_SECTION_KEY: u64 = 2;
+
+/// Read the prune floor persisted under [PRUNED_SECTION_KEY], if any.
+fn pruned_section<E: Context>(metadata: &Metadata<E, u64, Vec<u8>>) -> Result<Option<u64>, Error> {
+    metadata
+        .get(&PRUNED_SECTION_KEY)
+        .map(|bytes| {
+            bytes
+                .as_slice()
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| Error::Corruption("invalid pruned_section metadata".into()))
+        })
+        .transpose()
+}
 
 /// Configuration for `Journal` storage.
 #[derive(Clone)]
@@ -479,6 +502,20 @@ impl<E: Context, A: CodecFixedShared> Journal<E, A> {
             None => None,
         };
 
+        // Delete sections below the persisted prune floor whose deferred deletion had not run.
+        if let Some(floor) = pruned_section(&metadata)? {
+            if journal
+                .oldest_section()
+                .is_some_and(|oldest| oldest < floor)
+            {
+                warn!(
+                    floor,
+                    "crash repair: deleting sections below the prune floor"
+                );
+                journal.prune_deferred(floor).1.run().await?;
+            }
+        }
+
         // Recover bounds from metadata and/or blobs
         let (pruning_boundary, size, needs_metadata_update) =
             Self::recover_bounds(&journal, items_per_blob, meta_pruning_boundary).await?;
@@ -706,6 +743,10 @@ impl<E: Context, A: CodecFixedShared> Journal<E, A> {
         // - Crash after create: old metadata triggers "metadata ahead" warning,
         //   recovery falls back to blob state.
         journal.clear().await?;
+        if metadata.get(&PRUNED_SECTION_KEY).is_some() {
+            metadata.remove(&PRUNED_SECTION_KEY);
+            metadata.sync().await?;
+        }
         journal.ensure_section_exists(tail_section).await?;
 
         // Persist metadata if pruning_boundary is mid-section.
@@ -936,9 +977,20 @@ impl<E: Context, A: CodecFixedShared> Journal<E, A> {
     /// such items in order to preserve blob boundaries, but the amount of such items will always be
     /// less than the configured number of items per blob. Returns true if any items were pruned.
     ///
-    /// Note that this operation may NOT be atomic, however it's guaranteed not to leave gaps in the
-    /// event of failure as items are always pruned in order from oldest to newest.
+    /// The new floor is persisted before any blob is deleted, and blobs left below it by a crash
+    /// are deleted on [Self::init], so a failure never leaves gaps or resurrects pruned items.
     pub async fn prune(&self, min_item_pos: u64) -> Result<bool, Error> {
+        let (pruned, pending) = self.prune_deferred(min_item_pos).await?;
+        pending.run().await?;
+        Ok(pruned)
+    }
+
+    /// Like [Self::prune], but leaves deleting the pruned blobs to the returned [PendingDeletes].
+    ///
+    /// The pruned items are unreadable and their sections cannot be recreated as soon as this
+    /// returns, and the new floor is durable. Only the blob deletions (one batch with a single
+    /// directory sync) remain, so the caller can run them after releasing its own locks.
+    pub async fn prune_deferred(&self, min_item_pos: u64) -> Result<(bool, PendingDeletes), Error> {
         let mut inner = self.inner.write().await;
 
         // Calculate the section that would contain min_item_pos
@@ -950,7 +1002,21 @@ impl<E: Context, A: CodecFixedShared> Journal<E, A> {
         // Cap to tail section. The tail section is guaranteed to exist by our invariant.
         let min_section = std::cmp::min(target_section, tail_section);
 
-        let pruned = inner.journal.prune(min_section).await?;
+        if inner
+            .journal
+            .oldest_section()
+            .is_none_or(|oldest| oldest >= min_section)
+        {
+            return Ok((false, PendingDeletes::default()));
+        }
+
+        // Persist the new floor before releasing any section, so a crash before the deletions
+        // complete leaves only blobs that init deletes.
+        inner
+            .metadata
+            .put_sync(PRUNED_SECTION_KEY, min_section.to_be_bytes().to_vec())
+            .await?;
+        let (pruned, pending) = inner.journal.prune_deferred(min_section);
 
         // After pruning, update pruning_boundary to the start of the oldest remaining section
         if pruned {
@@ -965,7 +1031,12 @@ impl<E: Context, A: CodecFixedShared> Journal<E, A> {
                 .update(inner.size, inner.pruning_boundary, self.items_per_blob);
         }
 
-        Ok(pruned)
+        Ok((pruned, pending))
+    }
+
+    /// Returns the persisted prune floor (a section number), if any.
+    pub(crate) async fn pruned_section(&self) -> Result<Option<u64>, Error> {
+        pruned_section(&self.inner.read().await.metadata)
     }
 
     /// Remove any persisted data created by the journal.
@@ -996,6 +1067,10 @@ impl<E: Context, A: CodecFixedShared> Journal<E, A> {
         //   recovery falls back to blob state
         let mut inner = self.inner.write().await;
         inner.journal.clear().await?;
+        if inner.metadata.get(&PRUNED_SECTION_KEY).is_some() {
+            inner.metadata.remove(&PRUNED_SECTION_KEY);
+            inner.metadata.sync().await?;
+        }
         let tail_section = new_size / self.items_per_blob;
         inner.journal.ensure_section_exists(tail_section).await?;
 
@@ -1067,6 +1142,10 @@ impl<E: Context, A: CodecFixedShared> Mutable for Journal<E, A> {
 
     async fn prune(&mut self, min_position: u64) -> Result<bool, Error> {
         Self::prune(self, min_position).await
+    }
+
+    async fn prune_deferred(&mut self, min_position: u64) -> Result<(bool, PendingDeletes), Error> {
+        Self::prune_deferred(self, min_position).await
     }
 
     async fn rewind(&mut self, size: u64) -> Result<(), Error> {
@@ -1159,6 +1238,149 @@ mod tests {
             Err(RuntimeError::PartitionMissing(_)) => Vec::new(),
             Err(err) => panic!("Failed to scan partition {partition}: {err}"),
         }
+    }
+
+    /// Read a runtime counter from the deterministic context's encoded metrics.
+    fn runtime_counter(context: &Context, name: &str) -> u64 {
+        let prefix = format!("runtime_{name}_total ");
+        context
+            .encode()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix)?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Append `count` items to a new journal and sync it.
+    async fn journal_with_items(
+        context: Context,
+        cfg: Config,
+        count: u64,
+    ) -> Journal<Context, Digest> {
+        let journal = Journal::init(context, cfg).await.unwrap();
+        for i in 0..count {
+            journal.append(&test_digest(i)).await.unwrap();
+        }
+        journal.sync().await.unwrap();
+        journal
+    }
+
+    /// A deferred prune makes the pruned items unreadable and the new floor durable at once, but
+    /// leaves the blobs on disk until the pending deletes run, which needs no journal lock: the
+    /// journal keeps accepting appends in between.
+    #[test_traced]
+    fn test_fixed_journal_prune_deferred_deletes_after_run() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = test_cfg(&context, NZU64!(10));
+            let partition = blob_partition(&cfg);
+            let journal = journal_with_items(context.child("journal"), cfg.clone(), 100).await;
+            assert_eq!(scan_partition(&context, &partition).await.len(), 11);
+
+            let (pruned, pending) = journal.prune_deferred(45).await.unwrap();
+            assert!(pruned);
+            assert_eq!(pending.blobs(), 4);
+            assert_eq!(journal.bounds().await, 40..100);
+            assert!(matches!(journal.read(39).await, Err(Error::ItemPruned(39))));
+
+            // Blobs are still on disk, and the journal lock is free for appends.
+            assert_eq!(scan_partition(&context, &partition).await.len(), 11);
+            journal.append(&test_digest(100)).await.unwrap();
+            journal.sync().await.unwrap();
+
+            pending.run().await.unwrap();
+            assert_eq!(scan_partition(&context, &partition).await.len(), 7);
+            assert_eq!(journal.read(100).await.unwrap(), test_digest(100));
+            assert_eq!(journal.read(40).await.unwrap(), test_digest(40));
+
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// A crash after the floor is persisted but before the pending deletes run leaves pruned blobs
+    /// on disk. Reopening must delete them rather than read them back.
+    #[test_traced]
+    fn test_fixed_journal_prune_deferred_crash_before_delete() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = test_cfg(&context, NZU64!(10));
+            let partition = blob_partition(&cfg);
+            let journal = journal_with_items(context.child("first"), cfg.clone(), 100).await;
+
+            let (pruned, pending) = journal.prune_deferred(45).await.unwrap();
+            assert!(pruned);
+            // Crash: neither the pending deletes nor anything else runs.
+            drop(pending);
+            drop(journal);
+            assert_eq!(scan_partition(&context, &partition).await.len(), 11);
+
+            let journal = Journal::<_, Digest>::init(context.child("second"), cfg.clone())
+                .await
+                .unwrap();
+            assert_eq!(journal.bounds().await, 40..100);
+            assert!(matches!(journal.read(0).await, Err(Error::ItemPruned(0))));
+            let mut blobs = scan_partition(&context, &partition).await;
+            blobs.sort();
+            assert_eq!(blobs.first(), Some(&4u64.to_be_bytes().to_vec()));
+            assert_eq!(blobs.len(), 7);
+
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// Pruning many sections deletes them with one batched removal (one directory sync) rather
+    /// than one removal per blob.
+    #[test_traced]
+    fn test_fixed_journal_prune_batches_removals() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = test_cfg(&context, NZU64!(10));
+            let journal = journal_with_items(context.child("journal"), cfg.clone(), 500).await;
+
+            let removes = runtime_counter(&context, "storage_removes");
+            let removed = runtime_counter(&context, "storage_removed_blobs");
+            assert!(journal.prune(400).await.unwrap());
+            assert_eq!(runtime_counter(&context, "storage_removes") - removes, 1);
+            assert_eq!(
+                runtime_counter(&context, "storage_removed_blobs") - removed,
+                40
+            );
+
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// Clearing a journal while a deferred prune's deletes are pending deletes them first, so the
+    /// stale batch can never delete a section the cleared journal recreates.
+    #[test_traced]
+    fn test_fixed_journal_clear_with_pending_deletes() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = test_cfg(&context, NZU64!(10));
+            let partition = blob_partition(&cfg);
+            let journal = journal_with_items(context.child("journal"), cfg.clone(), 100).await;
+
+            let (_, pending) = journal.prune_deferred(50).await.unwrap();
+            journal.clear_to_size(25).await.unwrap();
+            for i in 25..40 {
+                journal.append(&test_digest(i)).await.unwrap();
+            }
+            journal.sync().await.unwrap();
+
+            // The stale batch deletes nothing the cleared journal uses.
+            pending.run().await.unwrap();
+            assert_eq!(journal.bounds().await, 25..40);
+            assert_eq!(journal.read(25).await.unwrap(), test_digest(25));
+            assert_eq!(scan_partition(&context, &partition).await.len(), 3);
+            drop(journal);
+
+            // The cleared journal also reopens intact: the old floor is gone.
+            let journal = Journal::<_, Digest>::init(context.child("second"), cfg.clone())
+                .await
+                .unwrap();
+            assert_eq!(journal.bounds().await, 25..40);
+            assert_eq!(journal.read(39).await.unwrap(), test_digest(39));
+            journal.destroy().await.unwrap();
+        });
     }
 
     #[test_traced]

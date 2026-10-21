@@ -57,6 +57,9 @@ pub struct Storage {
     lock: Arc<Mutex<()>>,
     cfg: Config,
     pool: BufferPool,
+    /// Directory syncs issued by blob removals.
+    #[cfg(test)]
+    dir_syncs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Storage {
@@ -65,6 +68,8 @@ impl Storage {
             lock: Arc::new(Mutex::new(())),
             cfg,
             pool,
+            #[cfg(test)]
+            dir_syncs: Arc::default(),
         }
     }
 }
@@ -206,6 +211,9 @@ impl crate::Storage for Storage {
             // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
             #[cfg(unix)]
             sync_dir(&path).await?;
+            #[cfg(all(unix, test))]
+            self.dir_syncs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
             fs::remove_dir_all(&path)
                 .await
@@ -232,6 +240,38 @@ impl crate::Storage for Storage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(Error::BlobOpenFailed(partition.into(), hex(name), error)),
         }
+    }
+
+    async fn remove_blobs(&self, partition: &str, names: &[&[u8]]) -> Result<(), Error> {
+        super::validate_partition_name(partition)?;
+
+        // Unlink every blob, taking the filesystem lock per unlink so other opens and removals
+        // can interleave with a large batch.
+        let path = self.cfg.storage_directory.join(partition);
+        let mut removed = false;
+        for name in names {
+            let _guard = self.lock.lock().await;
+            match fs::remove_file(path.join(hex(name))).await {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+
+        // Sync the partition directory once to make every removal durable.
+        // Windows doesn't have a notion of syncing a directory entry to ensure that it's
+        // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
+        #[cfg(unix)]
+        if removed {
+            let _guard = self.lock.lock().await;
+            sync_dir(&path).await?;
+            #[cfg(test)]
+            self.dir_syncs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(unix))]
+        let _ = removed;
+        Ok(())
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
@@ -289,6 +329,39 @@ mod tests {
         let config = Config::new(storage_directory, 2 * 1024 * 1024);
         let storage = Storage::new(config, test_pool());
         run_storage_tests(storage).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_blobs_syncs_directory_once() {
+        use std::sync::atomic::Ordering;
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_remove_{}", rng.gen::<u64>()));
+        let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
+        let names: Vec<[u8; 8]> = (0..64u64).map(u64::to_be_bytes).collect();
+        for name in &names {
+            storage.open("batch", name).await.unwrap();
+        }
+
+        // One removal at a time: one directory sync each.
+        for name in &names[..32] {
+            storage.remove("batch", Some(name)).await.unwrap();
+        }
+        assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 32);
+
+        // One batch: a single directory sync for all of them.
+        let rest: Vec<&[u8]> = names[32..].iter().map(|n| n.as_slice()).collect();
+        storage.remove_blobs("batch", &rest).await.unwrap();
+        assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 33);
+        assert!(storage.scan("batch").await.unwrap().is_empty());
+
+        // A batch that removes nothing does not sync.
+        storage.remove_blobs("batch", &rest).await.unwrap();
+        assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 33);
+
+        let _ = std::fs::remove_dir_all(storage_directory);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use crate::{
     journal::{
         authenticated,
         contiguous::{Contiguous, Mutable, Reader},
-        Error as JournalError,
+        Error as JournalError, PendingDeletes,
     },
     merkle::{Family, Location, Proof},
     qmdb::{
@@ -332,6 +332,8 @@ where
 
     /// Prune the operations log to `prune_loc`. Does not touch the bitmap.
     ///
+    /// Deleting the pruned blobs is left to the returned [PendingDeletes].
+    ///
     /// Journal pruning is section-granular, so the actual pruned boundary may be less than
     /// the requested `prune_loc`. Returns that actual boundary so callers can keep the bitmap
     /// aligned with the journal's retained start.
@@ -343,7 +345,7 @@ where
     pub(crate) async fn prune_log(
         &mut self,
         prune_loc: Location<F>,
-    ) -> Result<Location<F>, crate::qmdb::Error<F>> {
+    ) -> Result<(Location<F>, PendingDeletes), crate::qmdb::Error<F>> {
         if prune_loc > self.inactivity_floor_loc {
             return Err(crate::qmdb::Error::PruneBeyondMinRequired(
                 prune_loc,
@@ -351,7 +353,7 @@ where
             ));
         }
 
-        Ok(self.log.prune(prune_loc).await?)
+        Ok(self.log.prune_deferred(prune_loc).await?)
     }
 
     /// Prune historical operations prior to `prune_loc`. This does not affect the db's root or
@@ -366,12 +368,36 @@ where
         ),
     )]
     pub async fn prune(&mut self, prune_loc: Location<F>) -> Result<(), crate::qmdb::Error<F>> {
+        self.prune_deferred(prune_loc).await?.run().await?;
+        Ok(())
+    }
+
+    /// Like [Self::prune], but leaves deleting the pruned journal blobs to the returned
+    /// [PendingDeletes].
+    ///
+    /// When this returns the pruned operations are unreadable and the new pruning boundary is
+    /// durable; only the blob deletions remain. Run them after releasing any lock held around
+    /// this call so the deletions (one directory sync per journal partition) do not extend it. If
+    /// they never run, the blobs are deleted the next time the database is opened.
+    #[tracing::instrument(
+        name = "qmdb::any::Db::prune_deferred",
+        level = "info",
+        skip_all,
+        fields(
+            requested_loc = *prune_loc,
+            inactivity_floor = *self.inactivity_floor_loc,
+        ),
+    )]
+    pub async fn prune_deferred(
+        &mut self,
+        prune_loc: Location<F>,
+    ) -> Result<PendingDeletes, crate::qmdb::Error<F>> {
         let _timer = self.metrics.operations.prune_timer();
         self.metrics.operations.prune_calls.inc();
-        let actual_pruned = self.prune_log(prune_loc).await?;
+        let (actual_pruned, pending) = self.prune_log(prune_loc).await?;
         self.prune_bitmap(actual_pruned);
         self.update_metrics().await;
-        Ok(())
+        Ok(pending)
     }
 
     /// Returns a historical proof for `historical_size` operations, anchored at `start_loc`

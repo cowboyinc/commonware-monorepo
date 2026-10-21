@@ -344,4 +344,4 @@ hash = "f742d92a0af0af78a9519bf637bc52ea869965a85a84101a4c53f53eb39325ca"
 
 ["commonware_storage::queue::conformance::QueueConformance"]
 n_cases = 512
-hash = "718a6b9f3905c146aa0d95b2b32ea1557680940c3fe2a293b73a19a56a3ac000"
+hash = "d911bd1bdc0b2dd46a072cd84c0e3b5d8ca78397e0795dc43bbcfe7ad7d31ab3"

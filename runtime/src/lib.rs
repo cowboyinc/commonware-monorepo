@@ -729,6 +729,29 @@ stability_scope!(BETA {
             name: &[u8],
         ) -> impl Future<Output = Result<Option<u64>, Error>> + Send;
 
+        /// Remove several blobs from a given partition, making the removals durable together.
+        ///
+        /// Names that do not exist are skipped. Disk-backed implementations unlink every blob
+        /// and then sync the partition directory once, where [Storage::remove] syncs it once
+        /// per blob. A crash before this returns may leave any subset of the blobs in place.
+        ///
+        /// An Ok result indicates every named blob is durably removed.
+        fn remove_blobs(
+            &self,
+            partition: &str,
+            names: &[&[u8]],
+        ) -> impl Future<Output = Result<(), Error>> + Send {
+            async move {
+                for name in names {
+                    match self.remove(partition, Some(name)).await {
+                        Ok(()) | Err(Error::BlobMissing(..) | Error::PartitionMissing(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(())
+            }
+        }
+
         /// Return all blobs in a given partition.
         fn scan(&self, partition: &str)
             -> impl Future<Output = Result<Vec<Vec<u8>>, Error>> + Send;

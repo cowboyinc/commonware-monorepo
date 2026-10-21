@@ -117,6 +117,69 @@ pub(crate) mod decompress {
 #[cfg(all(test, feature = "arbitrary"))]
 mod conformance;
 
+/// Blob deletions released by a prune but not yet performed.
+///
+/// A deferred prune (e.g. [contiguous::fixed::Journal::prune_deferred]) persists the journal's new
+/// prune floor and drops the pruned sections from its in-memory view, so nothing can read, reuse,
+/// or recreate them. Physically deleting their blobs is left to [Self::run], which the caller can
+/// await after releasing whatever lock it held while pruning. Deletions are batched per partition
+/// with a single directory sync.
+///
+/// Dropping this without running it is safe: the blobs stay on disk below the persisted floor and
+/// are deleted by the next [Self::run] or `clear` on the same journal, or when the journal is
+/// reopened. Run (or drop) every pending delete before reopening the same journal in-process.
+#[must_use = "dropping pending deletes leaves pruned blobs on disk until the journal is reopened"]
+#[derive(Default)]
+pub struct PendingDeletes {
+    batches: Vec<futures::future::BoxFuture<'static, Result<(), Error>>>,
+    blobs: usize,
+}
+
+impl PendingDeletes {
+    pub(crate) fn new(
+        blobs: usize,
+        batch: futures::future::BoxFuture<'static, Result<(), Error>>,
+    ) -> Self {
+        Self {
+            batches: vec![batch],
+            blobs,
+        }
+    }
+
+    /// Returns the number of blobs released by the prunes this covers.
+    pub const fn blobs(&self) -> usize {
+        self.blobs
+    }
+
+    /// Returns true if there is nothing to delete.
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Add the deletions in `other` to these.
+    pub fn extend(&mut self, other: Self) {
+        self.batches.extend(other.batches);
+        self.blobs += other.blobs;
+    }
+
+    /// Delete the released blobs, one batch (and one directory sync) per partition.
+    pub async fn run(self) -> Result<(), Error> {
+        for batch in self.batches {
+            batch.await?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PendingDeletes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingDeletes")
+            .field("batches", &self.batches.len())
+            .field("blobs", &self.blobs)
+            .finish()
+    }
+}
+
 /// Errors that can occur when interacting with `Journal`.
 #[derive(Debug, Error)]
 pub enum Error {

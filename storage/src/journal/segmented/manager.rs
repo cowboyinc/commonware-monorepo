@@ -3,7 +3,7 @@
 //! This module provides `Manager`, a reusable component that handles
 //! section-based blob storage, pruning, syncing, and metrics.
 
-use crate::journal::Error;
+use crate::journal::{Error, PendingDeletes};
 use commonware_formatting::hex;
 use commonware_runtime::{
     buffer::{
@@ -13,8 +13,15 @@ use commonware_runtime::{
     telemetry::metrics::{Counter, Gauge, GaugeExt, MetricsExt as _},
     Blob, BufferPool, Error as RError, Metrics, Storage,
 };
-use futures::future::try_join_all;
-use std::{collections::BTreeMap, future::Future, mem::take, num::NonZeroUsize};
+use commonware_utils::sync::{AsyncMutex, Mutex};
+use futures::{future::try_join_all, FutureExt as _};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    mem::take,
+    num::NonZeroUsize,
+    sync::Arc,
+};
 use tracing::debug;
 
 /// A minimal [`Blob`] wrapper for [`Manager`].
@@ -120,13 +127,50 @@ pub struct Config<F> {
     pub factory: F,
 }
 
+/// Sections released by [Manager::prune_deferred] whose blobs are not yet deleted.
+///
+/// Shared between a [Manager] and the [PendingDeletes] it hands out. Sections stay in `sections`
+/// until a deletion removes them, and every deletion holds `deleting` while it runs, so
+/// [Manager::clear] can wait out an in-flight batch before reusing section numbers.
+#[derive(Default)]
+struct Released {
+    sections: Mutex<BTreeSet<u64>>,
+    deleting: AsyncMutex<()>,
+}
+
+impl Released {
+    /// Delete every released section's blob in one batch. On failure the sections stay
+    /// released, so a later attempt retries them (removal skips blobs already gone).
+    async fn delete<E: Storage>(&self, context: &E, partition: &str) -> Result<(), Error> {
+        let _deleting = self.deleting.lock().await;
+        let sections = take(&mut *self.sections.lock());
+        if sections.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<[u8; 8]> = sections.iter().map(|s| s.to_be_bytes()).collect();
+        let names: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+        if let Err(err) = context.remove_blobs(partition, &names).await {
+            self.sections.lock().extend(sections);
+            return Err(err.into());
+        }
+        debug!(
+            partition,
+            count = sections.len(),
+            first = sections.first().copied(),
+            last = sections.last().copied(),
+            "deleted released sections"
+        );
+        Ok(())
+    }
+}
+
 /// Manages a collection of section-based blobs.
 ///
 /// Each section is stored in a separate blob, named by its section number
 /// (big-endian u64). This component handles initialization, pruning, syncing,
 /// and metrics.
 pub struct Manager<E: Storage + Metrics, F: BufferFactory<E::Blob>> {
-    context: E,
+    context: Arc<E>,
     partition: String,
     factory: F,
 
@@ -137,6 +181,9 @@ pub struct Manager<E: Storage + Metrics, F: BufferFactory<E::Blob>> {
     /// the current execution. Not persisted across restarts.
     oldest_retained_section: u64,
 
+    /// Sections pruned by [Self::prune_deferred] whose blobs may still exist.
+    released: Arc<Released>,
+
     tracked: Gauge,
     synced: Counter,
     pruned: Counter,
@@ -145,7 +192,7 @@ pub struct Manager<E: Storage + Metrics, F: BufferFactory<E::Blob>> {
 impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
     /// The runtime context this manager was initialized with (e.g. for the
     /// sibling journal's duration timers, which need its `Clock`).
-    pub(super) const fn context(&self) -> &E {
+    pub(super) fn context(&self) -> &E {
         &self.context
     }
 
@@ -180,11 +227,12 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
         let _ = tracked.try_set(blobs.len());
 
         Ok(Self {
-            context,
+            context: Arc::new(context),
             partition: cfg.partition,
             factory: cfg.factory,
             blobs,
             oldest_retained_section: 0,
+            released: Arc::default(),
             tracked,
             synced,
             pruned,
@@ -272,6 +320,43 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
         Ok(pruned)
     }
 
+    /// Prune all sections less than `min` without deleting their blobs.
+    ///
+    /// The sections leave the in-memory view at once and become inaccessible (see
+    /// [Self::prune_guard]), but their blobs are only deleted when the returned [PendingDeletes]
+    /// runs, in one batch with a single directory sync. Because a crash can then leave any subset
+    /// of the blobs on disk, the caller must have durably recorded that sections below `min` are
+    /// pruned before calling this, and must remove leftover sections below that floor on reopen.
+    ///
+    /// Returns true if any sections were pruned.
+    pub fn prune_deferred(&mut self, min: u64) -> (bool, PendingDeletes) {
+        let retained = self.blobs.split_off(&min);
+        let pruned = take(&mut self.blobs);
+        self.blobs = retained;
+        if pruned.is_empty() {
+            return (false, PendingDeletes::default());
+        }
+
+        let count = pruned.len();
+        self.released.sections.lock().extend(pruned.into_keys());
+        self.oldest_retained_section = self.oldest_retained_section.max(min);
+        let _ = self.tracked.try_set(self.blobs.len());
+        self.pruned.inc_by(count as u64);
+        debug!(min, count, "released pruned sections");
+
+        let context = self.context.clone();
+        let partition = self.partition.clone();
+        let released = self.released.clone();
+        let batch = async move { released.delete(&*context, &partition).await }.boxed();
+        (true, PendingDeletes::new(count, batch))
+    }
+
+    /// Delete the blobs of any sections released by [Self::prune_deferred] that no
+    /// [PendingDeletes] has deleted yet, waiting for an in-flight batch to finish first.
+    pub async fn delete_released(&self) -> Result<(), Error> {
+        self.released.delete(&*self.context, &self.partition).await
+    }
+
     /// Returns the oldest section number, if any blobs exist.
     pub fn oldest_section(&self) -> Option<u64> {
         self.blobs.first_key_value().map(|(&s, _)| s)
@@ -322,6 +407,7 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
 
     /// Remove all underlying blobs.
     pub async fn destroy(self) -> Result<(), Error> {
+        self.delete_released().await?;
         for (section, blob) in self.blobs.into_iter() {
             let size = blob.size().await;
             drop(blob);
@@ -343,6 +429,8 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
     ///
     /// Unlike `destroy`, this keeps the manager alive so it can be reused.
     pub async fn clear(&mut self) -> Result<(), Error> {
+        // Released sections must be gone before section numbers can be reused.
+        self.delete_released().await?;
         let blobs = take(&mut self.blobs);
         for (section, blob) in blobs {
             let size = blob.size().await;

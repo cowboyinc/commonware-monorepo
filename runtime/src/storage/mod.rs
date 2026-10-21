@@ -286,6 +286,7 @@ pub(crate) mod tests {
         test_open_and_write(&storage).await;
         test_blob_len(&storage).await;
         test_remove(&storage).await;
+        test_remove_blobs(&storage).await;
         test_scan(&storage).await;
         test_concurrent_access(&storage).await;
         test_large_data(&storage).await;
@@ -384,6 +385,36 @@ pub(crate) mod tests {
 
         let blobs = storage.scan("partition").await.unwrap();
         assert!(blobs.is_empty(), "Blob was not removed as expected");
+    }
+
+    /// Test removing a batch of blobs, skipping names that do not exist.
+    async fn test_remove_blobs<S>(storage: &S)
+    where
+        S: Storage + Send + Sync,
+        S::Blob: Send + Sync,
+    {
+        for name in [b"batch_a", b"batch_b", b"batch_c"] {
+            storage.open("remove_blobs", name).await.unwrap();
+        }
+        storage
+            .remove_blobs("remove_blobs", &[b"batch_a", b"missing", b"batch_c"])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.scan("remove_blobs").await.unwrap(),
+            vec![b"batch_b".to_vec()]
+        );
+
+        // Removing nothing, or only missing blobs, succeeds.
+        storage.remove_blobs("remove_blobs", &[]).await.unwrap();
+        storage
+            .remove_blobs("remove_blobs", &[b"batch_a"])
+            .await
+            .unwrap();
+        storage
+            .remove("remove_blobs", Some(b"batch_b"))
+            .await
+            .unwrap();
     }
 
     /// Test scanning a partition for blobs.
