@@ -58,7 +58,7 @@ pub struct Storage {
     cfg: Config,
     pool: BufferPool,
     /// Directory syncs issued by blob removals.
-    #[cfg(test)]
+    #[cfg(all(unix, test))]
     dir_syncs: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -68,7 +68,7 @@ impl Storage {
             lock: Arc::new(Mutex::new(())),
             cfg,
             pool,
-            #[cfg(test)]
+            #[cfg(all(unix, test))]
             dir_syncs: Arc::default(),
         }
     }
