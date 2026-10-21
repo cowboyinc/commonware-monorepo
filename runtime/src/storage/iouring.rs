@@ -228,20 +228,26 @@ impl crate::Storage for Storage {
         // Unlink every blob, taking the filesystem lock per unlink so other opens and removals
         // can interleave with a large batch.
         let path = self.storage_directory.join(partition);
-        let mut removed = false;
         for name in names {
             let _guard = self.lock.lock();
             match fs::remove_file(path.join(hex(name))) {
-                Ok(()) => removed = true,
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Error::Io(e)),
             }
         }
 
-        // Sync the partition directory once to make every removal durable.
-        if removed {
+        // Sync the partition directory once to make every removal durable. Sync even if every
+        // name was already gone: an earlier attempt may have unlinked them and then failed (or
+        // been cancelled) before its own sync. Only a missing partition has nothing to sync.
+        if !names.is_empty() {
             let _guard = self.lock.lock();
-            sync_dir(&path)?;
+            match sync_dir(&path) {
+                Ok(()) => {}
+                Err(Error::BlobOpenFailed(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                }
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
