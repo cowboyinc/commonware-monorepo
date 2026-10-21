@@ -130,8 +130,9 @@ pub struct Config<F> {
 /// Sections released by [Manager::prune_deferred] whose blobs are not yet deleted.
 ///
 /// Shared between a [Manager] and the [PendingDeletes] it hands out. Sections stay in `sections`
-/// until a deletion removes them, and every deletion holds `deleting` while it runs, so
-/// [Manager::clear] can wait out an in-flight batch before reusing section numbers.
+/// until a deletion of them completes (a failed or cancelled deletion leaves them for the next),
+/// and every deletion holds `deleting` while it runs, so [Manager::clear] can wait out an
+/// in-flight batch before reusing section numbers.
 #[derive(Default)]
 struct Released {
     sections: Mutex<BTreeSet<u64>>,
@@ -139,20 +140,19 @@ struct Released {
 }
 
 impl Released {
-    /// Delete every released section's blob in one batch. On failure the sections stay
-    /// released, so a later attempt retries them (removal skips blobs already gone).
+    /// Delete every released section's blob in one batch. Until that succeeds the sections stay
+    /// released, so if it fails or is cancelled a later attempt retries them (removal skips blobs
+    /// already gone).
     async fn delete<E: Storage>(&self, context: &E, partition: &str) -> Result<(), Error> {
         let _deleting = self.deleting.lock().await;
-        let sections = take(&mut *self.sections.lock());
+        let sections = self.sections.lock().clone();
         if sections.is_empty() {
             return Ok(());
         }
         let names: Vec<[u8; 8]> = sections.iter().map(|s| s.to_be_bytes()).collect();
         let names: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
-        if let Err(err) = context.remove_blobs(partition, &names).await {
-            self.sections.lock().extend(sections);
-            return Err(err.into());
-        }
+        context.remove_blobs(partition, &names).await?;
+        self.sections.lock().retain(|s| !sections.contains(s));
         debug!(
             partition,
             count = sections.len(),

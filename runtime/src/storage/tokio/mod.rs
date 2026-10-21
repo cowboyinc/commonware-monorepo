@@ -246,31 +246,45 @@ impl crate::Storage for Storage {
         super::validate_partition_name(partition)?;
 
         // Unlink every blob, taking the filesystem lock per unlink so other opens and removals
-        // can interleave with a large batch.
+        // can interleave with a large batch. The blocking unlink owns the lock guard: if this
+        // future is dropped mid-unlink, the unlink still finishes before any later open can
+        // recreate the blob.
         let path = self.cfg.storage_directory.join(partition);
-        let mut removed = false;
         for name in names {
-            let _guard = self.lock.lock().await;
-            match fs::remove_file(path.join(hex(name))).await {
-                Ok(()) => removed = true,
+            let guard = self.lock.clone().lock_owned().await;
+            let blob_path = path.join(hex(name));
+            let unlinked = tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                std::fs::remove_file(blob_path)
+            })
+            .await
+            .map_err(|e| Error::Io(e.into()))?;
+            match unlinked {
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Error::Io(e)),
             }
         }
 
-        // Sync the partition directory once to make every removal durable.
+        // Sync the partition directory once to make every removal durable. Sync even if every
+        // name was already gone: an earlier attempt may have unlinked them and then failed (or
+        // been cancelled) before its own sync. Only a missing partition has nothing to sync.
         // Windows doesn't have a notion of syncing a directory entry to ensure that it's
         // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
         #[cfg(unix)]
-        if removed {
+        if !names.is_empty() {
             let _guard = self.lock.lock().await;
-            sync_dir(&path).await?;
-            #[cfg(test)]
-            self.dir_syncs
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match sync_dir(&path).await {
+                Ok(()) => {
+                    #[cfg(test)]
+                    self.dir_syncs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(Error::BlobOpenFailed(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                }
+                Err(err) => return Err(err),
+            }
         }
-        #[cfg(not(unix))]
-        let _ = removed;
         Ok(())
     }
 
@@ -357,9 +371,51 @@ mod tests {
         assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 33);
         assert!(storage.scan("batch").await.unwrap().is_empty());
 
-        // A batch that removes nothing does not sync.
-        storage.remove_blobs("batch", &rest).await.unwrap();
+        // An empty batch does not sync.
+        storage.remove_blobs("batch", &[]).await.unwrap();
         assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 33);
+
+        let _ = std::fs::remove_dir_all(storage_directory);
+    }
+
+    /// If every unlink succeeds but the directory sync fails, a retry finds every blob already
+    /// gone and must still sync the directory before reporting the removals durable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_blobs_retry_after_dir_sync_failure() {
+        use std::{os::unix::fs::PermissionsExt as _, sync::atomic::Ordering};
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_remove_retry_{}", rng.gen::<u64>()));
+        let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
+        let names: Vec<[u8; 8]> = (0..4u64).map(u64::to_be_bytes).collect();
+        for name in &names {
+            storage.open("retry", name).await.unwrap();
+        }
+        let names: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+
+        // Write+search but no read permission: unlinks succeed, opening the directory to sync
+        // it fails.
+        let partition = storage_directory.join("retry");
+        let set_mode = |mode| {
+            std::fs::set_permissions(&partition, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set_mode(0o300);
+        let first = storage.remove_blobs("retry", &names).await;
+        set_mode(0o700);
+        assert!(matches!(first, Err(Error::BlobOpenFailed(..))), "{first:?}");
+        assert!(storage.scan("retry").await.unwrap().is_empty());
+        assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 0);
+
+        // The retry unlinks nothing but still syncs.
+        storage.remove_blobs("retry", &names).await.unwrap();
+        assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 1);
+
+        // A missing partition has nothing to sync.
+        storage.remove("retry", None).await.unwrap();
+        storage.remove_blobs("retry", &names).await.unwrap();
+        assert_eq!(storage.dir_syncs.load(Ordering::Relaxed), 1);
 
         let _ = std::fs::remove_dir_all(storage_directory);
     }

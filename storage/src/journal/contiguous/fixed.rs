@@ -1383,6 +1383,57 @@ mod tests {
         });
     }
 
+    /// Cancelling a running batch of pending deletes leaves its sections released, so clearing
+    /// the journal still deletes them before section numbers are reused. Runs on the tokio
+    /// runtime, whose unlinks suspend, so the batch can be dropped mid-run.
+    #[test_traced]
+    fn test_fixed_journal_clear_after_cancelled_pending_deletes() {
+        use commonware_runtime::tokio;
+        use futures::FutureExt as _;
+
+        let storage_directory = std::env::temp_dir().join(format!(
+            "fixed_journal_cancelled_deletes_{}",
+            rand::random::<u64>()
+        ));
+        let executor =
+            tokio::Runner::new(tokio::Config::new().with_storage_directory(&storage_directory));
+        executor.start(|context| async move {
+            let cfg = test_cfg(&context, NZU64!(10));
+            let partition = blob_partition(&cfg);
+            let journal = Journal::init(context.child("journal"), cfg.clone())
+                .await
+                .unwrap();
+            for i in 0..100 {
+                journal.append(&test_digest(i)).await.unwrap();
+            }
+            journal.sync().await.unwrap();
+
+            // Start deleting sections 0..9, then drop the batch while it is unlinking.
+            let (_, pending) = journal.prune_deferred(95).await.unwrap();
+            assert_eq!(pending.blobs(), 9);
+            let mut run = pending.run().boxed();
+            assert!(run.as_mut().now_or_never().is_none());
+            drop(run);
+
+            // Clearing deletes every released section, not just the retained ones, and the
+            // reused sections start empty.
+            journal.clear_to_size(25).await.unwrap();
+            for i in 25..40 {
+                journal.append(&test_digest(i)).await.unwrap();
+            }
+            journal.sync().await.unwrap();
+            let mut blobs = context.scan(&partition).await.unwrap();
+            blobs.sort();
+            let expected: Vec<_> = (2..5u64).map(|s| s.to_be_bytes().to_vec()).collect();
+            assert_eq!(blobs, expected);
+            assert_eq!(journal.bounds().await, 25..40);
+            assert_eq!(journal.read(25).await.unwrap(), test_digest(25));
+            assert_eq!(journal.read(39).await.unwrap(), test_digest(39));
+            journal.destroy().await.unwrap();
+        });
+        let _ = std::fs::remove_dir_all(storage_directory);
+    }
+
     #[test_traced]
     fn test_fixed_journal_init_conflicting_partitions() {
         let executor = deterministic::Runner::default();
