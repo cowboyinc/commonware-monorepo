@@ -276,6 +276,13 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
         self.inner.blob_len(partition, name).await
     }
 
+    async fn remove_blobs(&self, partition: &str, names: &[&[u8]]) -> Result<(), Error> {
+        if self.ctx.should_fail(Op::Remove) {
+            return Err(Error::Io(injected_io_error()));
+        }
+        self.inner.remove_blobs(partition, names).await
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         if self.ctx.should_fail(Op::Scan) {
             return Err(Error::Io(injected_io_error()));

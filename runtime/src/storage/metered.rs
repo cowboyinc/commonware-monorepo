@@ -13,6 +13,8 @@ pub struct Metrics {
     pub storage_read_bytes: Counter,
     pub storage_writes: Counter,
     pub storage_write_bytes: Counter,
+    pub storage_removes: Counter,
+    pub storage_removed_blobs: Counter,
 }
 
 impl Metrics {
@@ -42,6 +44,16 @@ impl Metrics {
             storage_write_bytes: registry.register(
                 "storage_write_bytes",
                 "Total amount of data written to disk",
+                raw::Counter::default(),
+            ),
+            storage_removes: registry.register(
+                "storage_removes",
+                "Total number of remove calls (each syncs the directory at most once)",
+                raw::Counter::default(),
+            ),
+            storage_removed_blobs: registry.register(
+                "storage_removed_blobs",
+                "Total number of blobs named by remove calls",
                 raw::Counter::default(),
             ),
         }
@@ -92,11 +104,25 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
     }
 
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
+        self.metrics.storage_removes.inc();
+        if name.is_some() {
+            self.metrics.storage_removed_blobs.inc();
+        }
         self.inner.remove(partition, name).await
     }
 
     async fn blob_len(&self, partition: &str, name: &[u8]) -> Result<Option<u64>, Error> {
         self.inner.blob_len(partition, name).await
+    }
+
+    async fn remove_blobs(&self, partition: &str, names: &[&[u8]]) -> Result<(), Error> {
+        if !names.is_empty() {
+            self.metrics.storage_removes.inc();
+            self.metrics
+                .storage_removed_blobs
+                .inc_by(names.len() as u64);
+        }
+        self.inner.remove_blobs(partition, names).await
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {

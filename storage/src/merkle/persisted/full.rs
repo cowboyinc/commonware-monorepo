@@ -12,7 +12,7 @@ use crate::{
             fixed::{Config as JConfig, Journal},
             Many, Reader,
         },
-        Error as JError,
+        Error as JError, PendingDeletes,
     },
     merkle::{
         batch,
@@ -661,6 +661,14 @@ impl<F: Family, E: RStorage + Clock + Metrics, D: Digest, S: Strategy> Merkle<F,
     /// Returns [Error::LocationOverflow] if `loc` exceeds [Family::MAX_LEAVES].
     /// Returns [Error::LeafOutOfBounds] if `loc` exceeds the current leaf count.
     pub async fn prune(&mut self, loc: Location<F>) -> Result<(), Error<F>> {
+        self.prune_deferred(loc).await?.run().await?;
+        Ok(())
+    }
+
+    /// Like [Self::prune], but leaves deleting the pruned journal blobs to the returned
+    /// [PendingDeletes], so the caller can run them after releasing its own locks. The new pruning
+    /// boundary is durable when this returns.
+    pub async fn prune_deferred(&mut self, loc: Location<F>) -> Result<PendingDeletes, Error<F>> {
         let pos = Position::try_from(loc)?;
         {
             let inner = self.inner.get_mut();
@@ -668,7 +676,7 @@ impl<F: Family, E: RStorage + Clock + Metrics, D: Digest, S: Strategy> Merkle<F,
                 return Err(Error::LeafOutOfBounds(loc));
             }
             if pos <= inner.pruned_to_pos {
-                return Ok(());
+                return Ok(PendingDeletes::default());
             }
         }
 
@@ -679,12 +687,12 @@ impl<F: Family, E: RStorage + Clock + Metrics, D: Digest, S: Strategy> Merkle<F,
         // event of a pruning failure.
         let pinned_nodes = self.update_metadata(pos).await?;
 
-        self.journal.prune(*pos).await?;
+        let (_, pending) = self.journal.prune_deferred(*pos).await?;
         let inner = self.inner.get_mut();
         inner.mem.add_pinned_nodes(pinned_nodes);
         inner.pruned_to_pos = pos;
 
-        Ok(())
+        Ok(pending)
     }
 
     /// Compute the root of the structure using `inactive_peaks` and the bagging carried by `hasher`.

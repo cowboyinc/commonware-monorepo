@@ -6,7 +6,7 @@ use crate::{
     index::Unordered as UnorderedIndex,
     journal::{
         contiguous::{Contiguous, Mutable, Reader},
-        Error as JournalError,
+        Error as JournalError, PendingDeletes,
     },
     merkle::{
         self,
@@ -515,6 +515,26 @@ where
     /// - Returns [Error::DataCorrupted] if internal grafted-tree state is inconsistent (a pinned
     ///   or retained node is missing, or the prune location overflows a [Position]).
     pub async fn prune(&mut self, prune_loc: Location<F>) -> Result<(), Error<F>> {
+        self.prune_deferred(prune_loc).await?.run().await?;
+        Ok(())
+    }
+
+    /// Like [Self::prune], but leaves deleting the pruned journal blobs to the returned
+    /// [PendingDeletes].
+    ///
+    /// When this returns the pruned operations are unreadable and the new pruning boundary (with
+    /// the grafted tree's pinned nodes) is durable; only the blob deletions remain. Run them after
+    /// releasing any lock held around this call so the deletions (one directory sync per journal
+    /// partition) do not extend it. If they never run, the blobs are deleted the next time the
+    /// database is opened.
+    ///
+    /// # Errors
+    ///
+    /// The same as [Self::prune].
+    pub async fn prune_deferred(
+        &mut self,
+        prune_loc: Location<F>,
+    ) -> Result<PendingDeletes, Error<F>> {
         let _timer = self.metrics.prune_timer();
         self.metrics.prune_calls.inc();
         let sync_boundary = self.sync_boundary();
@@ -533,10 +553,10 @@ where
         // a pruned log with stale metadata would lose peak digests permanently.
         self.sync_metadata().await?;
 
-        self.any.prune_log(prune_loc).await?;
+        let (_, pending) = self.any.prune_log(prune_loc).await?;
         self.any.update_metrics().await;
         self.update_metrics();
-        Ok(())
+        Ok(pending)
     }
 
     /// Rewind the database to `size` operations, where `size` is the location of the next append.

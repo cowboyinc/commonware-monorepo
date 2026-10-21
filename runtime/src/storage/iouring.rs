@@ -222,6 +222,30 @@ impl crate::Storage for Storage {
         }
     }
 
+    async fn remove_blobs(&self, partition: &str, names: &[&[u8]]) -> Result<(), Error> {
+        super::validate_partition_name(partition)?;
+
+        // Unlink every blob, taking the filesystem lock per unlink so other opens and removals
+        // can interleave with a large batch.
+        let path = self.storage_directory.join(partition);
+        let mut removed = false;
+        for name in names {
+            let _guard = self.lock.lock();
+            match fs::remove_file(path.join(hex(name))) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+
+        // Sync the partition directory once to make every removal durable.
+        if removed {
+            let _guard = self.lock.lock();
+            sync_dir(&path)?;
+        }
+        Ok(())
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
 

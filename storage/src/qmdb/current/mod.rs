@@ -2142,6 +2142,81 @@ pub mod tests {
         });
     }
 
+    /// Count the blobs of the variable-config journals behind `prefix`.
+    async fn journal_blobs(context: &Context, prefix: &str) -> usize {
+        let mut count = 0;
+        for partition in [
+            format!("{prefix}-journal-partition-blobs"),
+            format!("{prefix}-partition-prefix_data"),
+            format!("{prefix}-partition-prefix_offsets-blobs"),
+        ] {
+            count += commonware_runtime::Storage::scan(context, &partition)
+                .await
+                .map_or(0, |blobs| blobs.len());
+        }
+        count
+    }
+
+    /// A deferred prune is durable without its deletes: whether they run after more commits, or
+    /// never run because of a crash, the database reopens with the same root and bounds and no
+    /// pruned blob left behind.
+    #[test_traced]
+    fn test_current_prune_deferred() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            for (prefix, crash) in [("deferred_run", false), ("deferred_crash", true)] {
+                let db_ctx = context.child("db");
+                let mut db: UnorderedVariableDb = UnorderedVariableDb::init(
+                    db_ctx.child("db"),
+                    variable_config::<OneCap>(prefix, &db_ctx),
+                )
+                .await
+                .unwrap();
+                for i in 0..200u64 {
+                    commit_writes(&mut db, [(key(i % 7), Some(val(i)))])
+                        .await
+                        .unwrap();
+                }
+                db.sync().await.unwrap();
+                let blobs = journal_blobs(&context, prefix).await;
+
+                let pending = db.prune_deferred(db.sync_boundary()).await.unwrap();
+                assert!(pending.blobs() > 0);
+                let bounds = db.bounds().await;
+                assert!(*bounds.start > 0);
+                assert_eq!(journal_blobs(&context, prefix).await, blobs);
+
+                if crash {
+                    drop(pending);
+                } else {
+                    // The deletes need no access to the database, which keeps committing.
+                    commit_writes(&mut db, [(key(0), Some(val(1000)))])
+                        .await
+                        .unwrap();
+                    pending.run().await.unwrap();
+                    assert!(journal_blobs(&context, prefix).await < blobs);
+                }
+                let root = db.root();
+                let bounds = db.bounds().await;
+                let value = db.get(&key(0)).await.unwrap();
+                drop(db);
+
+                let reopen_ctx = context.child("db_reopen");
+                let db: UnorderedVariableDb = UnorderedVariableDb::init(
+                    reopen_ctx.child("db"),
+                    variable_config::<OneCap>(prefix, &reopen_ctx),
+                )
+                .await
+                .unwrap();
+                assert_eq!(db.root(), root);
+                assert_eq!(db.bounds().await, bounds);
+                assert_eq!(db.get(&key(0)).await.unwrap(), value);
+                assert!(journal_blobs(&context, prefix).await < blobs);
+                db.destroy().await.unwrap();
+            }
+        });
+    }
+
     /// Grow past 2 full pruned chunks, prune, reopen, verify root + value.
     #[test_traced]
     fn test_current_mmb_reopen_after_prune_two_chunks() {

@@ -4,7 +4,7 @@
 //! contiguously and can be accessed by their position (0-indexed). Both [fixed]-size and
 //! [variable]-size item journals are supported.
 
-use super::Error;
+use super::{Error, PendingDeletes};
 use futures::Stream;
 use std::{future::Future, num::NonZeroUsize, ops::Range};
 use tracing::warn;
@@ -200,6 +200,19 @@ pub trait Mutable: Contiguous + Send + Sync {
         &mut self,
         min_position: u64,
     ) -> impl std::future::Future<Output = Result<bool, Error>> + Send;
+
+    /// Like [Self::prune], but leaves deleting the pruned blobs to the returned
+    /// [PendingDeletes] so the caller can run them later (e.g. after releasing a lock).
+    ///
+    /// Pruned items are unreadable once this returns, and implementations persist the new
+    /// pruning boundary before returning so a crash before the deletions run never brings pruned
+    /// items back. The default implementation prunes eagerly and returns nothing to delete.
+    fn prune_deferred(
+        &mut self,
+        min_position: u64,
+    ) -> impl std::future::Future<Output = Result<(bool, PendingDeletes), Error>> + Send {
+        async move { Ok((self.prune(min_position).await?, PendingDeletes::default())) }
+    }
 
     /// Rewind the journal to the given size, discarding items from the end.
     ///

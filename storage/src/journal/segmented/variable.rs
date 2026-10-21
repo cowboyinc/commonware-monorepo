@@ -81,7 +81,7 @@
 //! ```
 
 use super::manager::{AppendFactory, Config as ManagerConfig, Manager};
-use crate::journal::{decompress::decode_frame, Error};
+use crate::journal::{decompress::decode_frame, Error, PendingDeletes};
 use commonware_codec::{
     varint::{UInt, MAX_U32_VARINT_SIZE},
     Codec, CodecShared, EncodeSize, ReadExt, Write as CodecWrite,
@@ -926,6 +926,18 @@ impl<E: Storage + Clock + Metrics, V: CodecShared> Journal<E, V> {
     /// Prunes all `sections` less than `min`. Returns true if any sections were pruned.
     pub async fn prune(&mut self, min: u64) -> Result<bool, Error> {
         self.manager.prune(min).await
+    }
+
+    /// Prune all sections less than `min`, deferring deletion of their blobs to the returned
+    /// [PendingDeletes]. The caller must have durably recorded the new floor first and must remove
+    /// leftover sections below it on reopen. Returns true if any were pruned.
+    pub fn prune_deferred(&mut self, min: u64) -> (bool, PendingDeletes) {
+        self.manager.prune_deferred(min)
+    }
+
+    /// Delete the blobs of sections released by [Self::prune_deferred] that are still on disk.
+    pub async fn delete_released(&self) -> Result<(), Error> {
+        self.manager.delete_released().await
     }
 
     /// Returns the number of the oldest section in the journal.

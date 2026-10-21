@@ -69,6 +69,16 @@ impl<S: crate::Storage> crate::Storage for Storage<S> {
         self.inner.blob_len(partition, name).await
     }
 
+    async fn remove_blobs(&self, partition: &str, names: &[&[u8]]) -> Result<(), Error> {
+        self.auditor.event(b"remove_blobs", |hasher| {
+            hasher.update(partition.as_bytes());
+            for name in names {
+                hasher.update(name);
+            }
+        });
+        self.inner.remove_blobs(partition, names).await
+    }
+
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         self.auditor.event(b"scan", |hasher| {
             hasher.update(partition.as_bytes());

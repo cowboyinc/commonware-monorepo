@@ -8,7 +8,7 @@ use crate::{
     journal::{
         contiguous::{fixed, metrics::VariableMetrics as Metrics, Contiguous, Many, Mutable},
         segmented::variable,
-        Error,
+        Error, PendingDeletes,
     },
     Context, Persistable,
 };
@@ -447,6 +447,18 @@ impl<E: Context, V: CodecShared> Journal<E, V> {
         )
         .await?;
 
+        // Delete data sections below the prune floor (persisted by the offsets journal, which
+        // deleted its own leftovers on init) whose deferred deletion had not run.
+        if let Some(floor) = offsets.pruned_section().await? {
+            if data.oldest_section().is_some_and(|oldest| oldest < floor) {
+                warn!(
+                    floor,
+                    "crash repair: deleting data sections below the prune floor"
+                );
+                data.prune_deferred(floor).1.run().await?;
+            }
+        }
+
         // Validate and align offsets journal to match data journal
         let (pruning_boundary, size) =
             Self::align_journals(&mut data, &mut offsets, items_per_section).await?;
@@ -811,10 +823,22 @@ impl<E: Context, V: CodecShared> Journal<E, V> {
     /// Errors may leave the journal in an inconsistent state. The journal should be closed and
     /// reopened to trigger alignment in [Journal::init].
     pub async fn prune(&self, min_position: u64) -> Result<bool, Error> {
+        let (pruned, pending) = self.prune_deferred(min_position).await?;
+        pending.run().await?;
+        Ok(pruned)
+    }
+
+    /// Like [Self::prune], but leaves deleting the pruned blobs (of both the data and the offsets
+    /// journal) to the returned [PendingDeletes], so the caller can run them after releasing its
+    /// own locks. The pruned items are unreadable and the new boundary is durable on return.
+    ///
+    /// The offsets journal's persisted prune floor is the floor for both journals: it is written
+    /// before either releases a section, and [Self::init] deletes data sections below it.
+    pub async fn prune_deferred(&self, min_position: u64) -> Result<(bool, PendingDeletes), Error> {
         let mut inner = self.inner.write().await;
 
         if min_position <= inner.pruning_boundary {
-            return Ok(false);
+            return Ok((false, PendingDeletes::default()));
         }
 
         // Cap min_position to size to maintain the invariant pruning_boundary <= size
@@ -823,15 +847,27 @@ impl<E: Context, V: CodecShared> Journal<E, V> {
         // Calculate section number
         let min_section = position_to_section(min_position, self.items_per_section);
 
-        let pruned = inner.data.prune(min_section).await?;
-        if pruned {
-            let new_oldest = (min_section * self.items_per_section).max(inner.pruning_boundary);
-            inner.pruning_boundary = new_oldest;
-            self.offsets.prune(new_oldest).await?;
-            self.metrics
-                .update(inner.size, inner.pruning_boundary, self.items_per_section);
+        if inner
+            .data
+            .oldest_section()
+            .is_none_or(|oldest| oldest >= min_section)
+        {
+            return Ok((false, PendingDeletes::default()));
         }
-        Ok(pruned)
+
+        let new_oldest = (min_section * self.items_per_section).max(inner.pruning_boundary);
+        let (offsets_pruned, mut pending) = self.offsets.prune_deferred(new_oldest).await?;
+        if !offsets_pruned {
+            return Err(Error::Corruption(format!(
+                "offsets journal has no section below {min_section} but the data journal does"
+            )));
+        }
+        let (_, data_pending) = inner.data.prune_deferred(min_section);
+        pending.extend(data_pending);
+        inner.pruning_boundary = new_oldest;
+        self.metrics
+            .update(inner.size, inner.pruning_boundary, self.items_per_section);
+        Ok((true, pending))
     }
 
     /// Durably persist the journal.
@@ -1169,6 +1205,10 @@ impl<E: Context, V: CodecShared> Mutable for Journal<E, V> {
 
     async fn prune(&mut self, min_position: u64) -> Result<bool, Error> {
         Self::prune(self, min_position).await
+    }
+
+    async fn prune_deferred(&mut self, min_position: u64) -> Result<(bool, PendingDeletes), Error> {
+        Self::prune_deferred(self, min_position).await
     }
 
     async fn rewind(&mut self, size: u64) -> Result<(), Error> {
@@ -1892,12 +1932,72 @@ mod tests {
         });
     }
 
-    /// Test recovery detects corruption when offsets journal pruned ahead of data journal.
-    ///
-    /// Simulates an impossible state (offsets journal pruned more than data journal) which
-    /// should never happen due to write ordering. Verifies that init() returns corruption error.
+    /// A crash after a deferred prune persisted its floor but before its deletes ran leaves the
+    /// pruned data and offsets blobs on disk. Reopening deletes them rather than reading them.
     #[test_traced]
-    fn test_variable_recovery_offsets_ahead_corruption() {
+    fn test_variable_prune_deferred_crash_before_delete() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = Config {
+                partition: "prune-deferred-crash".into(),
+                items_per_section: NZU64!(10),
+                compression: None,
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, LARGE_PAGE_SIZE, NZUsize!(10)),
+                write_buffer: NZUsize!(1024),
+            };
+            let variable = Journal::<_, u64>::init(context.child("first"), cfg.clone())
+                .await
+                .unwrap();
+            for i in 0..40u64 {
+                variable.append(&(i * 100)).await.unwrap();
+            }
+            variable.sync().await.unwrap();
+
+            let (pruned, pending) = variable.prune_deferred(25).await.unwrap();
+            assert!(pruned);
+            assert_eq!(pending.blobs(), 4); // two data and two offsets sections
+            assert_eq!(variable.bounds().await, 20..40);
+            assert!(matches!(variable.read(19).await, Err(Error::ItemPruned(_))));
+            drop(pending);
+            drop(variable);
+
+            let section = |s: u64| s.to_be_bytes().to_vec();
+            let offsets_partition = format!("{}-blobs", cfg.offsets_partition());
+            assert!(context
+                .scan(&cfg.data_partition())
+                .await
+                .unwrap()
+                .contains(&section(0)));
+            assert!(context
+                .scan(&offsets_partition)
+                .await
+                .unwrap()
+                .contains(&section(0)));
+
+            let variable = Journal::<_, u64>::init(context.child("second"), cfg.clone())
+                .await
+                .unwrap();
+            assert_eq!(variable.bounds().await, 20..40);
+            assert!(matches!(variable.read(0).await, Err(Error::ItemPruned(_))));
+            assert_eq!(variable.read(20).await.unwrap(), 2000);
+            for partition in [cfg.data_partition(), offsets_partition] {
+                let blobs = context.scan(&partition).await.unwrap();
+                assert!(!blobs.contains(&section(0)), "{partition}");
+                assert!(!blobs.contains(&section(1)), "{partition}");
+            }
+
+            variable.destroy().await.unwrap();
+        });
+    }
+
+    /// Test recovery when the offsets journal is pruned ahead of the data journal.
+    ///
+    /// The offsets journal persists the prune floor for both journals before either releases a
+    /// section, so this is the state a crash leaves when the data journal's deletions had not run.
+    /// Verifies that init() deletes the data sections below the floor instead of reading them.
+    #[test_traced]
+    fn test_variable_recovery_offsets_ahead_deletes_data_below_floor() {
         let executor = deterministic::Runner::default();
         executor.start(|context| async move {
             // === Setup: Create Variable wrapper with data ===
@@ -1919,16 +2019,24 @@ mod tests {
                 variable.append(&(i * 100)).await.unwrap();
             }
 
-            // Prune offsets journal ahead of data journal (impossible state)
+            // Prune offsets journal ahead of data journal
             variable.test_prune_offsets(20).await.unwrap(); // Prune to position 20
             variable.test_prune_data(1).await.unwrap(); // Only prune data journal to section 1 (position 10)
 
             variable.sync().await.unwrap();
             drop(variable);
 
-            // === Verify corruption detected ===
-            let result = Journal::<_, u64>::init(context.child("second"), cfg.clone()).await;
-            assert!(matches!(result, Err(Error::Corruption(_))));
+            // === Verify data below the floor is deleted, not read ===
+            let variable = Journal::<_, u64>::init(context.child("second"), cfg.clone())
+                .await
+                .unwrap();
+            assert_eq!(variable.bounds().await, 20..40);
+            assert!(matches!(variable.read(10).await, Err(Error::ItemPruned(_))));
+            assert_eq!(variable.read(20).await.unwrap(), 2000);
+            let data_blobs = context.scan(&cfg.data_partition()).await.unwrap();
+            assert!(!data_blobs.contains(&1u64.to_be_bytes().to_vec()));
+
+            variable.destroy().await.unwrap();
         });
     }
 

@@ -8,7 +8,7 @@
 use crate::{
     journal::{
         contiguous::{fixed, variable, Contiguous, Many, Mutable, Reader},
-        Error as JournalError,
+        Error as JournalError, PendingDeletes,
     },
     merkle::{
         self, batch,
@@ -540,18 +540,34 @@ where
     /// # Returns
     /// The new pruning boundary, which may be less than the requested `prune_loc`.
     pub async fn prune(&mut self, prune_loc: Location<F>) -> Result<Location<F>, Error<F>> {
+        let (boundary, pending) = self.prune_deferred(prune_loc).await?;
+        pending.run().await?;
+        Ok(boundary)
+    }
+
+    /// Like [Self::prune], but leaves deleting the pruned blobs to the returned [PendingDeletes],
+    /// so the caller can run them after releasing its own locks. The new pruning boundary is
+    /// durable when this returns.
+    pub async fn prune_deferred(
+        &mut self,
+        prune_loc: Location<F>,
+    ) -> Result<(Location<F>, PendingDeletes), Error<F>> {
         self.prune_inner(prune_loc)
             .await
-            .map(|(boundary, _)| boundary)
+            .map(|(boundary, _, pending)| (boundary, pending))
     }
 
     async fn prune_inner(
         &mut self,
         prune_loc: Location<F>,
-    ) -> Result<(Location<F>, bool), Error<F>> {
+    ) -> Result<(Location<F>, bool, PendingDeletes), Error<F>> {
         if self.merkle.size() == 0 {
             // DB is empty, nothing to prune.
-            return Ok((Location::new(self.reader().await.bounds().start), false));
+            return Ok((
+                Location::new(self.reader().await.bounds().start),
+                false,
+                PendingDeletes::default(),
+            ));
         }
 
         // Sync the Merkle structure before pruning the journal, otherwise its last element could
@@ -559,17 +575,21 @@ where
         // replay the items between the structure's last element and the journal's first element.
         self.merkle.sync().await?;
 
-        let journal_pruned = self.journal.prune(*prune_loc).await?;
+        let (journal_pruned, mut pending) = self.journal.prune_deferred(*prune_loc).await?;
         let bounds = self.reader().await.bounds();
         let boundary = Location::new(bounds.start);
         let merkle_boundary = self.merkle.bounds().start;
 
         if boundary > merkle_boundary {
             debug!(size = ?bounds.end, ?prune_loc, boundary = ?bounds.start, "pruned inactive ops");
-            self.merkle.prune(boundary).await?;
+            pending.extend(self.merkle.prune_deferred(boundary).await?);
         }
 
-        Ok((boundary, journal_pruned || boundary > merkle_boundary))
+        Ok((
+            boundary,
+            journal_pruned || boundary > merkle_boundary,
+            pending,
+        ))
     }
 }
 
@@ -772,11 +792,29 @@ where
             min_position.min(bounds.end)
         };
 
-        let (_, pruned) = self
+        let (_, pruned, pending) = self
             .prune_inner(Location::new(prune_to))
             .await
             .map_err(Self::map_error)?;
+        pending.run().await?;
         Ok(pruned)
+    }
+
+    async fn prune_deferred(
+        &mut self,
+        min_position: u64,
+    ) -> Result<(bool, PendingDeletes), JournalError> {
+        let prune_to = {
+            let reader = self.journal.reader().await;
+            let bounds = reader.bounds();
+            min_position.min(bounds.end)
+        };
+
+        let (_, pruned, pending) = self
+            .prune_inner(Location::new(prune_to))
+            .await
+            .map_err(Self::map_error)?;
+        Ok((pruned, pending))
     }
 
     async fn rewind(&mut self, size: u64) -> Result<(), JournalError> {
