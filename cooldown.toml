@@ -2,3 +2,11 @@ cooldown_minutes = 10080
 enforcement = "strict"
 lockfile_baseline = "ignore"
 cache_dir = "target/cargo-cooldown"
+
+# RUSTSEC-2026-0385: ctutils before 0.4.4 can compile constant-time masks to
+# branches. 0.4.4 and 0.4.5 were both published 2026-10-23, inside the cooldown
+# window, so no cooled release carries the fix. Remove this entry once 0.4.5 has
+# cooled (after 2026-10-30).
+[[allow.exact]]
+crate = "ctutils"
+version = "0.4.5"
