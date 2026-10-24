@@ -9,9 +9,35 @@ use core::{
     hash::{Hash, Hasher},
     ops::Deref,
 };
-use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::{
+    ecdsa::{SigningKey, VerifyingKey},
+    elliptic_curve::Generate,
+};
 use rand_core::CryptoRngCore;
 use zeroize::Zeroizing;
+
+// Commonware's RNG trait is rand_core 0.6; RustCrypto 0.14 requires 0.10.
+// Forward the same cryptographic entropy without changing the public trait.
+struct CurveRng<R: CryptoRngCore>(R);
+
+impl<R: CryptoRngCore> p256::elliptic_curve::rand_core::TryRng for CurveRng<R> {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.0.next_u32())
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.0.next_u64())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.fill_bytes(dst);
+        Ok(())
+    }
+}
+
+impl<R: CryptoRngCore> p256::elliptic_curve::rand_core::TryCryptoRng for CurveRng<R> {}
 
 pub const CURVE_NAME: &str = "secp256r1";
 pub const PRIVATE_KEY_LENGTH: usize = 32;
@@ -48,8 +74,8 @@ impl PrivateKeyInner {
 }
 
 impl Random for PrivateKeyInner {
-    fn random(mut rng: impl CryptoRngCore) -> Self {
-        Self::new(SigningKey::random(&mut rng))
+    fn random(rng: impl CryptoRngCore) -> Self {
+        Self::new(SigningKey::generate_from_rng(&mut CurveRng(rng)))
     }
 }
 
@@ -110,7 +136,7 @@ pub struct PublicKeyInner {
 
 impl PublicKeyInner {
     pub fn new(key: VerifyingKey) -> Self {
-        let encoded = key.to_encoded_point(true);
+        let encoded = key.to_sec1_point(true);
         let raw: [u8; PUBLIC_KEY_LENGTH] = encoded.as_bytes().try_into().unwrap();
         Self { raw, key }
     }
@@ -123,7 +149,7 @@ impl PublicKeyInner {
     /// in memory, extracting the uncompressed form directly is faster.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn to_uncompressed(&self) -> [u8; 65] {
-        let encoded = self.key.to_encoded_point(false);
+        let encoded = self.key.to_sec1_point(false);
         encoded.as_bytes().try_into().unwrap()
     }
 }
@@ -585,9 +611,9 @@ pub(crate) mod tests {
     pub fn parse_signature(r: &str, s: &str) -> p256::ecdsa::Signature {
         let vec_r = commonware_formatting::from_hex(r).unwrap();
         let vec_s = commonware_formatting::from_hex(s).unwrap();
-        let f1 = p256::FieldBytes::from_slice(&vec_r);
-        let f2 = p256::FieldBytes::from_slice(&vec_s);
-        p256::ecdsa::Signature::from_scalars(*f1, *f2).unwrap()
+        let f1 = p256::FieldBytes::try_from(vec_r.as_slice()).unwrap();
+        let f2 = p256::FieldBytes::try_from(vec_s.as_slice()).unwrap();
+        p256::ecdsa::Signature::from_scalars(f1, f2).unwrap()
     }
 
     pub fn vector_sig_verification_1_raw() -> (PublicKeyInner, p256::ecdsa::Signature, Vec<u8>, bool)
