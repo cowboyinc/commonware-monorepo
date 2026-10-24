@@ -13,6 +13,9 @@ workflows:
         "propagate-feature",
         # These are the features to check:
         "--features=std,arbitrary,mocks",
+        # p256/std also enables its OS getrandom backend. This portable crate
+        # uses caller-provided RNGs and p256/alloc, including for bare WASM.
+        "--ignore-missing-propagate=commonware-cryptography/std:p256/std",
         # Do not try to add a new section into `[features]` of `A` only because `B` exposes that feature.
         # There are edge-cases where this is still needed, but we can add them manually.
         "--left-side-feature-missing=ignore",

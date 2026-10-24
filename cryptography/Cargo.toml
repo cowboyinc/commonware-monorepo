@@ -120,6 +120,7 @@ std = [
 	"num-rational",
 	"num-traits",
 	"num-traits?/std",
+	# p256/std also selects OS entropy; this portable crate takes caller RNGs.
 	"p256/alloc",
 	"rand/std",
 	"rand/std_rng",
