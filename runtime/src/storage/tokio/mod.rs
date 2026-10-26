@@ -61,6 +61,9 @@ pub struct Storage {
     /// Directory syncs issued by blob removals.
     #[cfg(all(unix, test))]
     dir_syncs: Arc<std::sync::atomic::AtomicUsize>,
+    /// Raw file lengths observed immediately before writing a fresh header.
+    #[cfg(test)]
+    header_write_sizes: Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
 impl Storage {
@@ -71,6 +74,8 @@ impl Storage {
             pool,
             #[cfg(all(unix, test))]
             dir_syncs: Arc::default(),
+            #[cfg(test)]
+            header_write_sizes: Arc::default(),
         }
     }
 }
@@ -171,6 +176,11 @@ impl crate::Storage for Storage {
             file.seek(SeekFrom::Start(0))
                 .await
                 .map_err(|_| Error::WriteFailed)?;
+            #[cfg(test)]
+            self.header_write_sizes
+                .lock()
+                .unwrap()
+                .push(std::fs::metadata(&path).unwrap().len());
             file.write_all(&header.encode())
                 .await
                 .map_err(|_| Error::WriteFailed)?;
@@ -650,11 +660,21 @@ mod tests {
 
         let torn_path = partition_path.join(hex(b"torn"));
         std::fs::write(&torn_path, [0u8; Header::SIZE]).unwrap();
-        let (_, size) = storage.open("partition", b"torn").await.unwrap();
+        let (blob, size) = storage.open("partition", b"torn").await.unwrap();
         assert_eq!(size, 0);
         let raw = std::fs::read(&torn_path).unwrap();
         assert_eq!(raw.len(), Header::SIZE);
         assert_eq!(&raw[..Header::MAGIC_LENGTH], &Header::MAGIC);
+
+        let data = b"recovered data";
+        blob.write_at(0, data).await.unwrap();
+        blob.sync().await.unwrap();
+        drop(blob);
+        let reopened = Storage::new(storage.cfg.clone(), test_pool());
+        let (blob, size) = reopened.open("partition", b"torn").await.unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(blob.read_at(0, data.len()).await.unwrap().coalesce(), data);
+        drop(blob);
 
         let data_path = partition_path.join(hex(b"data"));
         std::fs::write(&data_path, [0u8; Header::SIZE + 1]).unwrap();
@@ -665,6 +685,50 @@ mod tests {
         assert_eq!(std::fs::read(&data_path).unwrap(), [0u8; Header::SIZE + 1]);
 
         let _ = std::fs::remove_dir_all(&storage_directory);
+    }
+
+    #[tokio::test]
+    async fn test_blob_header_write_starts_empty() {
+        let storage_directory = env::temp_dir().join(format!(
+            "storage_tokio_header_order_{}",
+            rand::random::<u64>()
+        ));
+        let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
+        let (blob, size) = storage.open("partition", b"new").await.unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(*storage.header_write_sizes.lock().unwrap(), vec![0]);
+        assert_eq!(
+            std::fs::read(storage_directory.join("partition").join(hex(b"new"))).unwrap(),
+            Header::new(&(0..=0)).0.encode().as_ref()
+        );
+        drop(blob);
+        std::fs::remove_dir_all(storage_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_blob_partial_header_recovery() {
+        let storage_directory = env::temp_dir().join(format!(
+            "storage_tokio_partial_header_{}",
+            rand::random::<u64>()
+        ));
+        let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
+        let partition = storage_directory.join("partition");
+        std::fs::create_dir_all(&partition).unwrap();
+        let header = Header::new(&(7..=7)).0.encode();
+        for len in 0..Header::SIZE {
+            let name = [len as u8];
+            let path = partition.join(hex(&name));
+            std::fs::write(&path, &header[..len]).unwrap();
+            let (blob, size, version) = storage
+                .open_versioned("partition", &name, 7..=7)
+                .await
+                .unwrap();
+            assert_eq!(size, 0);
+            assert_eq!(version, 7);
+            assert_eq!(std::fs::read(&path).unwrap(), header.as_ref());
+            drop(blob);
+        }
+        std::fs::remove_dir_all(storage_directory).unwrap();
     }
 
     #[tokio::test]

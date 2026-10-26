@@ -74,6 +74,9 @@ pub struct Storage {
     storage_directory: PathBuf,
     io_handle: iouring::Handle,
     pool: BufferPool,
+    /// Raw file lengths observed immediately before writing a fresh header.
+    #[cfg(test)]
+    header_write_sizes: Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
 impl Storage {
@@ -98,6 +101,8 @@ impl Storage {
             storage_directory,
             io_handle,
             pool,
+            #[cfg(test)]
+            header_write_sizes: Arc::default(),
         };
 
         utils::thread::spawn(thread_stack_size, move || iouring_loop.run());
@@ -167,6 +172,11 @@ impl crate::Storage for Storage {
                 .map_err(|e| Error::BlobResizeFailed(partition.into(), hex(name), e))?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| Error::WriteFailed)?;
+            #[cfg(test)]
+            self.header_write_sizes
+                .lock()
+                .unwrap()
+                .push(file.metadata().unwrap().len());
             file.write_all(&header.encode())
                 .map_err(|_| Error::WriteFailed)?;
             file.sync_all()
@@ -665,11 +675,87 @@ mod tests {
             .await
             .err()
             .expect("bad magic should fail");
-        assert!(err
-            .to_string()
-            .starts_with("blob corrupt: partition/6261645f6d61676963 reason: invalid magic"));
+        assert!(
+            matches!(err, Error::BlobCorrupt(_, _, reason) if reason.contains("invalid magic"))
+        );
 
         let _ = std::fs::remove_dir_all(&storage_directory);
+    }
+
+    #[tokio::test]
+    async fn test_blob_header_write_starts_empty() {
+        let (storage, storage_directory) = create_test_storage();
+        let (blob, size) = storage.open("partition", b"new").await.unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(*storage.header_write_sizes.lock().unwrap(), vec![0]);
+        assert_eq!(
+            std::fs::read(storage_directory.join("partition").join(hex(b"new"))).unwrap(),
+            Header::new(&(0..=0)).0.encode().as_ref()
+        );
+        drop(blob);
+        std::fs::remove_dir_all(storage_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_blob_torn_creation() {
+        let (storage, storage_directory) = create_test_storage();
+        let partition = storage_directory.join("partition");
+        std::fs::create_dir_all(&partition).unwrap();
+        let torn_path = partition.join(hex(b"torn"));
+        std::fs::write(&torn_path, [0u8; Header::SIZE]).unwrap();
+        let (blob, size, version) = storage
+            .open_versioned("partition", b"torn", 3..=7)
+            .await
+            .unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(version, 7);
+        assert_eq!(
+            std::fs::read(&torn_path).unwrap(),
+            Header::new(&(7..=7)).0.encode().as_ref()
+        );
+        let data = b"recovered data";
+        blob.write_at(0, data).await.unwrap();
+        blob.sync().await.unwrap();
+        drop(blob);
+        let (blob, size, version) = storage
+            .open_versioned("partition", b"torn", 3..=7)
+            .await
+            .unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(version, 7);
+        assert_eq!(blob.read_at(0, data.len()).await.unwrap().coalesce(), data);
+        drop(blob);
+
+        let data_path = partition.join(hex(b"data"));
+        std::fs::write(&data_path, [0u8; Header::SIZE + 1]).unwrap();
+        let result = storage.open("partition", b"data").await;
+        assert!(
+            matches!(result, Err(Error::BlobCorrupt(_, _, reason)) if reason.contains("invalid magic"))
+        );
+        assert_eq!(std::fs::read(data_path).unwrap(), [0u8; Header::SIZE + 1]);
+        std::fs::remove_dir_all(storage_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_blob_partial_header_recovery() {
+        let (storage, storage_directory) = create_test_storage();
+        let partition = storage_directory.join("partition");
+        std::fs::create_dir_all(&partition).unwrap();
+        let header = Header::new(&(7..=7)).0.encode();
+        for len in 0..Header::SIZE {
+            let name = [len as u8];
+            let path = partition.join(hex(&name));
+            std::fs::write(&path, &header[..len]).unwrap();
+            let (blob, size, version) = storage
+                .open_versioned("partition", &name, 7..=7)
+                .await
+                .unwrap();
+            assert_eq!(size, 0);
+            assert_eq!(version, 7);
+            assert_eq!(std::fs::read(&path).unwrap(), header.as_ref());
+            drop(blob);
+        }
+        std::fs::remove_dir_all(storage_directory).unwrap();
     }
 
     #[tokio::test]
