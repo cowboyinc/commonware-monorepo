@@ -4,12 +4,13 @@ use commonware_codec::Encode;
 use commonware_formatting::{from_hex, hex};
 #[cfg(unix)]
 use std::path::Path;
-use std::{ops::RangeInclusive, path::PathBuf, sync::Arc};
+use std::{io::SeekFrom, ops::RangeInclusive, path::PathBuf, sync::Arc};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex,
 };
+use tracing::warn;
 
 #[cfg(not(unix))]
 mod fallback;
@@ -60,6 +61,9 @@ pub struct Storage {
     /// Directory syncs issued by blob removals.
     #[cfg(all(unix, test))]
     dir_syncs: Arc<std::sync::atomic::AtomicUsize>,
+    /// Raw file lengths observed immediately before writing a fresh header.
+    #[cfg(test)]
+    header_write_sizes: Arc<commonware_utils::sync::Mutex<Vec<u64>>>,
 }
 
 impl Storage {
@@ -70,6 +74,8 @@ impl Storage {
             pool,
             #[cfg(all(unix, test))]
             dir_syncs: Arc::default(),
+            #[cfg(test)]
+            header_write_sizes: Arc::default(),
         }
     }
 }
@@ -147,12 +153,33 @@ impl crate::Storage for Storage {
 
         // Handle header: new/corrupted blobs get a fresh header written,
         // existing blobs have their header read.
-        let (blob_version, logical_size) = if Header::missing(len) {
-            // New or corrupted blob - truncate and write header with latest version
+        let mut header_bytes = [0u8; Header::SIZE];
+        if !Header::missing(len) {
+            file.read_exact(&mut header_bytes)
+                .await
+                .map_err(|_| Error::ReadFailed)?;
+        }
+        let (blob_version, logical_size) = if Header::missing(len)
+            || Header::torn(len, &header_bytes)
+        {
+            if !Header::missing(len) {
+                warn!(partition, name = %hex(name), "recreating blob left torn by an interrupted creation");
+            }
+            // New, partially-created, or torn blob: reset it and write a fresh header. The
+            // file grows only as header bytes are written, so a creation interrupted by a
+            // process crash leaves a prefix of the header (handled by `missing`) instead of
+            // a full-length all-zero header.
             let (header, blob_version) = Header::new(&versions);
-            file.set_len(Header::SIZE_U64)
+            file.set_len(0)
                 .await
                 .map_err(|e| Error::BlobResizeFailed(partition.into(), hex(name), e))?;
+            file.seek(SeekFrom::Start(0))
+                .await
+                .map_err(|_| Error::WriteFailed)?;
+            #[cfg(test)]
+            self.header_write_sizes
+                .lock()
+                .push(std::fs::metadata(&path).unwrap().len());
             file.write_all(&header.encode())
                 .await
                 .map_err(|_| Error::WriteFailed)?;
@@ -161,11 +188,7 @@ impl crate::Storage for Storage {
                 .map_err(|e| Error::BlobSyncFailed(partition.into(), hex(name), e))?;
             (blob_version, 0)
         } else {
-            // Existing blob - read and validate header
-            let mut header_bytes = [0u8; Header::SIZE];
-            file.read_exact(&mut header_bytes)
-                .await
-                .map_err(|_| Error::ReadFailed)?;
+            // Existing blob - validate the header read above
             Header::from(header_bytes, len, &versions).map_err(|e| e.into_error(partition, name))?
         };
 
@@ -606,7 +629,7 @@ mod tests {
         let partition_path = storage_directory.join("partition");
         std::fs::create_dir_all(&partition_path).unwrap();
         let bad_magic_path = partition_path.join(hex(b"bad_magic"));
-        std::fs::write(&bad_magic_path, vec![0u8; Header::SIZE]).unwrap();
+        std::fs::write(&bad_magic_path, b"XXXX\0\0\0\0").unwrap();
 
         // Opening should fail with corrupt error
         let result = storage.open("partition", b"bad_magic").await;
@@ -615,6 +638,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&storage_directory);
+    }
+
+    #[tokio::test]
+    async fn test_blob_torn_creation() {
+        // A creation that extended the file to a full header but never wrote it leaves
+        // exactly 8 zero bytes. Such a blob holds no data and reopens as a fresh, empty blob.
+        // A longer blob with a zero header holds data and stays corrupt.
+        let storage_directory =
+            env::temp_dir().join(format!("test_torn_creation_{}", rand::random::<u64>()));
+        let storage = Storage::new(
+            Config {
+                storage_directory: storage_directory.clone(),
+                maximum_buffer_size: 1024 * 1024,
+            },
+            test_pool(),
+        );
+        let partition_path = storage_directory.join("partition");
+        std::fs::create_dir_all(&partition_path).unwrap();
+
+        let torn_path = partition_path.join(hex(b"torn"));
+        std::fs::write(&torn_path, [0u8; Header::SIZE]).unwrap();
+        let (blob, size) = storage.open("partition", b"torn").await.unwrap();
+        assert_eq!(size, 0);
+        let raw = std::fs::read(&torn_path).unwrap();
+        assert_eq!(raw.len(), Header::SIZE);
+        assert_eq!(&raw[..Header::MAGIC_LENGTH], &Header::MAGIC);
+
+        let data = b"recovered data";
+        blob.write_at(0, data).await.unwrap();
+        blob.sync().await.unwrap();
+        drop(blob);
+        let reopened = Storage::new(storage.cfg.clone(), test_pool());
+        let (blob, size) = reopened.open("partition", b"torn").await.unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(blob.read_at(0, data.len()).await.unwrap().coalesce(), data);
+        drop(blob);
+
+        let data_path = partition_path.join(hex(b"data"));
+        std::fs::write(&data_path, [0u8; Header::SIZE + 1]).unwrap();
+        let result = storage.open("partition", b"data").await;
+        assert!(
+            matches!(result, Err(crate::Error::BlobCorrupt(_, _, reason)) if reason.contains("invalid magic"))
+        );
+        assert_eq!(std::fs::read(&data_path).unwrap(), [0u8; Header::SIZE + 1]);
+
+        let _ = std::fs::remove_dir_all(&storage_directory);
+    }
+
+    #[tokio::test]
+    async fn test_blob_header_write_starts_empty() {
+        let storage_directory = env::temp_dir().join(format!(
+            "storage_tokio_header_order_{}",
+            rand::random::<u64>()
+        ));
+        let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
+        let (blob, size) = storage.open("partition", b"new").await.unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(*storage.header_write_sizes.lock(), vec![0]);
+        assert_eq!(
+            std::fs::read(storage_directory.join("partition").join(hex(b"new"))).unwrap(),
+            Header::new(&(0..=0)).0.encode().as_ref()
+        );
+        drop(blob);
+        std::fs::remove_dir_all(storage_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_blob_partial_header_recovery() {
+        let storage_directory = env::temp_dir().join(format!(
+            "storage_tokio_partial_header_{}",
+            rand::random::<u64>()
+        ));
+        let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
+        let partition = storage_directory.join("partition");
+        std::fs::create_dir_all(&partition).unwrap();
+        let header = Header::new(&(7..=7)).0.encode();
+        for len in 0..Header::SIZE {
+            let name = [len as u8];
+            let path = partition.join(hex(&name));
+            std::fs::write(&path, &header[..len]).unwrap();
+            let (blob, size, version) = storage
+                .open_versioned("partition", &name, 7..=7)
+                .await
+                .unwrap();
+            assert_eq!(size, 0);
+            assert_eq!(version, 7);
+            assert_eq!(std::fs::read(&path).unwrap(), header.as_ref());
+            drop(blob);
+        }
+        std::fs::remove_dir_all(storage_directory).unwrap();
     }
 
     #[tokio::test]

@@ -56,8 +56,10 @@ impl crate::Storage for Storage {
         let content = partition_entry.entry(name.into()).or_default();
 
         let raw_len = content.len() as u64;
-        let (blob_version, logical_len) = if Header::missing(raw_len) {
-            // New or corrupted blob - truncate and write default header with latest version
+        let torn = !Header::missing(raw_len)
+            && Header::torn(raw_len, content[..Header::SIZE].try_into().unwrap());
+        let (blob_version, logical_len) = if Header::missing(raw_len) || torn {
+            // New, corrupted, or torn blob - truncate and write default header with latest version
             let (header, blob_version) = Header::new(&versions);
             content.clear();
             content.extend_from_slice(&header.encode());
@@ -336,6 +338,12 @@ mod tests {
         let read_buf = blob.read_at(0, data.len()).await.unwrap();
         assert_eq!(read_buf.coalesce(), data);
 
+        drop(blob);
+        let (blob, size) = storage.open("partition", b"test").await.unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(blob.read_at(0, data.len()).await.unwrap().coalesce(), data);
+        drop(blob);
+
         // Corrupted blob recovery (0 < raw_size < 8)
         {
             let mut partitions = storage.partitions.lock();
@@ -368,7 +376,7 @@ mod tests {
         {
             let mut partitions = storage.partitions.lock();
             let partition = partitions.entry("partition".into()).or_default();
-            partition.insert(b"bad_magic".to_vec(), vec![0u8; Header::SIZE]);
+            partition.insert(b"bad_magic".to_vec(), b"XXXX\0\0\0\0".to_vec());
         }
 
         // Opening should fail with corrupt error
@@ -376,5 +384,72 @@ mod tests {
         assert!(
             matches!(result, Err(crate::Error::BlobCorrupt(_, _, reason)) if reason.contains("invalid magic"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_torn_creation() {
+        let storage = Storage::new(test_pool());
+        {
+            let mut partitions = storage.partitions.lock();
+            let partition = partitions.entry("partition".into()).or_default();
+            partition.insert(b"torn".to_vec(), vec![0u8; Header::SIZE]);
+            partition.insert(b"data".to_vec(), vec![0u8; Header::SIZE + 1]);
+        }
+        let (blob, size, version) = storage
+            .open_versioned("partition", b"torn", 3..=7)
+            .await
+            .unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(version, 7);
+        {
+            let partitions = storage.partitions.lock();
+            assert_eq!(
+                partitions["partition"][b"torn".as_slice()],
+                Header::new(&(7..=7)).0.encode().as_ref()
+            );
+        }
+        let data = b"recovered data";
+        blob.write_at(0, data).await.unwrap();
+        blob.sync().await.unwrap();
+        drop(blob);
+        let (blob, size, version) = storage
+            .open_versioned("partition", b"torn", 3..=7)
+            .await
+            .unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(version, 7);
+        assert_eq!(blob.read_at(0, data.len()).await.unwrap().coalesce(), data);
+
+        let result = storage.open("partition", b"data").await;
+        assert!(
+            matches!(result, Err(crate::Error::BlobCorrupt(_, _, reason)) if reason.contains("invalid magic"))
+        );
+        let partitions = storage.partitions.lock();
+        assert_eq!(
+            partitions["partition"][b"data".as_slice()],
+            vec![0u8; Header::SIZE + 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_partial_header_recovery() {
+        let storage = Storage::new(test_pool());
+        let header = Header::new(&(7..=7)).0.encode();
+        for len in 0..Header::SIZE {
+            let name = [len as u8];
+            {
+                let mut partitions = storage.partitions.lock();
+                let partition = partitions.entry("partition".into()).or_default();
+                partition.insert(name.to_vec(), header[..len].to_vec());
+            }
+            let (_, size, version) = storage
+                .open_versioned("partition", &name, 7..=7)
+                .await
+                .unwrap();
+            assert_eq!(size, 0);
+            assert_eq!(version, 7);
+            let partitions = storage.partitions.lock();
+            assert_eq!(partitions["partition"][name.as_slice()], header.as_ref());
+        }
     }
 }
