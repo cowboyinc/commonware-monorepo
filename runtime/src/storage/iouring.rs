@@ -76,7 +76,7 @@ pub struct Storage {
     pool: BufferPool,
     /// Raw file lengths observed immediately before writing a fresh header.
     #[cfg(test)]
-    header_write_sizes: Arc<std::sync::Mutex<Vec<u64>>>,
+    header_write_sizes: Arc<Mutex<Vec<u64>>>,
 }
 
 impl Storage {
@@ -175,7 +175,6 @@ impl crate::Storage for Storage {
             #[cfg(test)]
             self.header_write_sizes
                 .lock()
-                .unwrap()
                 .push(file.metadata().unwrap().len());
             file.write_all(&header.encode())
                 .map_err(|_| Error::WriteFailed)?;
@@ -687,7 +686,7 @@ mod tests {
         let (storage, storage_directory) = create_test_storage();
         let (blob, size) = storage.open("partition", b"new").await.unwrap();
         assert_eq!(size, 0);
-        assert_eq!(*storage.header_write_sizes.lock().unwrap(), vec![0]);
+        assert_eq!(*storage.header_write_sizes.lock(), vec![0]);
         assert_eq!(
             std::fs::read(storage_directory.join("partition").join(hex(b"new"))).unwrap(),
             Header::new(&(0..=0)).0.encode().as_ref()

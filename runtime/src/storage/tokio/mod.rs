@@ -63,7 +63,7 @@ pub struct Storage {
     dir_syncs: Arc<std::sync::atomic::AtomicUsize>,
     /// Raw file lengths observed immediately before writing a fresh header.
     #[cfg(test)]
-    header_write_sizes: Arc<std::sync::Mutex<Vec<u64>>>,
+    header_write_sizes: Arc<commonware_utils::sync::Mutex<Vec<u64>>>,
 }
 
 impl Storage {
@@ -179,7 +179,6 @@ impl crate::Storage for Storage {
             #[cfg(test)]
             self.header_write_sizes
                 .lock()
-                .unwrap()
                 .push(std::fs::metadata(&path).unwrap().len());
             file.write_all(&header.encode())
                 .await
@@ -696,7 +695,7 @@ mod tests {
         let storage = Storage::new(Config::new(storage_directory.clone(), 1024), test_pool());
         let (blob, size) = storage.open("partition", b"new").await.unwrap();
         assert_eq!(size, 0);
-        assert_eq!(*storage.header_write_sizes.lock().unwrap(), vec![0]);
+        assert_eq!(*storage.header_write_sizes.lock(), vec![0]);
         assert_eq!(
             std::fs::read(storage_directory.join("partition").join(hex(b"new"))).unwrap(),
             Header::new(&(0..=0)).0.encode().as_ref()
