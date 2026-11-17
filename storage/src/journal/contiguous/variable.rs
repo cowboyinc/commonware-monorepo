@@ -2695,7 +2695,7 @@ mod tests {
             assert_eq!(journal.read(7).await.unwrap(), 777);
 
             // Sync only the data journal to simulate a crash before offsets are synced.
-            let section = 7 / cfg.items_per_section.get();
+            let section = 7 / cfg.items_per_section;
             journal
                 .inner
                 .write()

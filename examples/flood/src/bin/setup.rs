@@ -167,7 +167,7 @@ fn main() {
         let region_index = index % regions.len();
         let region = regions[region_index].clone();
         let instance = aws::InstanceConfig {
-            name: name.clone(),
+            name,
             region,
             instance_type: instance_type.clone(),
             storage_size,

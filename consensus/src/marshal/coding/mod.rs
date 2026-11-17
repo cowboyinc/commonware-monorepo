@@ -1269,7 +1269,7 @@ mod tests {
                     leader: me.clone(),
                     parent: (last_view, last_commitment),
                 };
-                let block = make_coding_block(ctx.clone(), parent, Height::new(i), i * 100);
+                let block = make_coding_block(ctx, parent, Height::new(i), i * 100);
                 let coded_block = CodedBlock::new(block.clone(), coding_config, &Sequential);
                 last_commitment = coded_block.commitment();
                 shards.proposed(round, coded_block);

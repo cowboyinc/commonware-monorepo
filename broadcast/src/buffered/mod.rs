@@ -362,7 +362,7 @@ mod tests {
             };
             let (engine, engine_mailbox) =
                 Engine::<_, PublicKey, TestMessage, _>::new(context, config);
-            mailboxes.insert(peer.clone(), engine_mailbox);
+            mailboxes.insert(peer, engine_mailbox);
             engine.start(network);
         }
 
@@ -973,7 +973,7 @@ mod tests {
                 peer_provider: oracle.manager(),
             };
             let (engine, engine_mailbox) = Engine::<_, PublicKey, TestMessage, _>::new(ctx, config);
-            mailboxes.insert(peer.clone(), engine_mailbox);
+            mailboxes.insert(peer, engine_mailbox);
             handles.push(engine.start(network));
         }
 
