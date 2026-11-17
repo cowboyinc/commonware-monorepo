@@ -934,7 +934,7 @@ pub fn proposed_success_implies_recoverable_after_restart<H: TestHarness>(
             let participants = participants.clone();
             let me = me.clone();
             let provider = provider.clone();
-            let block = block.clone();
+            let block = block;
             move |context| async move {
                 let mut oracle = setup_network_with_participants(
                     context.child("network"),
@@ -1043,7 +1043,7 @@ pub fn verified_success_implies_recoverable_after_restart<H: TestHarness>(
             let participants = participants.clone();
             let me = me.clone();
             let provider = provider.clone();
-            let block = block.clone();
+            let block = block;
             move |context| async move {
                 let mut oracle = setup_network_with_participants(
                     context.child("network"),
@@ -1158,7 +1158,7 @@ pub fn certified_success_implies_recoverable_after_restart<H: TestHarness>(
             let participants = participants.clone();
             let me = me.clone();
             let provider = provider.clone();
-            let block = block.clone();
+            let block = block;
             move |context| async move {
                 let mut oracle = setup_network_with_participants(
                     context.child("network"),
@@ -1492,8 +1492,8 @@ pub fn delivery_visibility_implies_recoverable_after_restart<H: TestHarness>(
             let participants = participants.clone();
             let me = me.clone();
             let provider = provider.clone();
-            let application = application.clone();
-            let block = block.clone();
+            let application = application;
+            let block = block;
             let finalization = finalization.clone();
             move |context| async move {
                 let mut oracle = setup_network_with_participants(

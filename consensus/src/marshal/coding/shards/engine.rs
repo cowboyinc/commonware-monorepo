@@ -1964,7 +1964,7 @@ mod tests {
 
                     let config = Config {
                         scheme_provider,
-                        blocker: control.clone(),
+                        blocker: control,
                         shard_codec_cfg: CodecConfig {
                             maximum_shard_size: MAX_SHARD_SIZE,
                         },
@@ -2003,7 +2003,7 @@ mod tests {
 
                     let config = Config {
                         scheme_provider,
-                        blocker: control.clone(),
+                        blocker: control,
                         shard_codec_cfg: CodecConfig {
                             maximum_shard_size: MAX_SHARD_SIZE,
                         },

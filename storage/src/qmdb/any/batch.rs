@@ -340,10 +340,9 @@ impl<'a, K: Ord, F: Family, V> Iterator for DiffMerge<'a, K, F, V> {
         }
         let level = winner?;
         let (slice, pos) = self.cursors[level];
-        for inner in 0..n {
-            let (s, p) = self.cursors[inner];
-            if s.get(p).is_some_and(|(k, _)| *k == slice[pos].0) {
-                self.cursors[inner].1 += 1;
+        for (s, p) in &mut self.cursors {
+            if s.get(*p).is_some_and(|(k, _)| *k == slice[pos].0) {
+                *p += 1;
             }
         }
         Some((&slice[pos].0, &slice[pos].1))
