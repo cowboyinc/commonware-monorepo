@@ -1258,7 +1258,7 @@ mod tests {
             );
 
             if !proof.digests.is_empty() {
-                let mut tampered_digest = proof.clone();
+                let mut tampered_digest = proof;
                 tampered_digest.digests[0].0[0] ^= 1;
                 assert!(
                     !tampered_digest
@@ -1306,7 +1306,7 @@ mod tests {
             );
 
             if !proof.digests.is_empty() {
-                let mut tampered_digest = proof.clone();
+                let mut tampered_digest = proof;
                 tampered_digest.digests[0].0[0] ^= 1;
                 assert!(
                     !tampered_digest.verify_multi_inclusion(&hasher, &elements, &root),

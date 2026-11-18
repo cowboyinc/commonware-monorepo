@@ -609,7 +609,7 @@ pub mod tests {
                     &wrong_root,
                 ));
                 // Proof should fail with the wrong next-key.
-                let mut bad_proof = proof.clone();
+                let mut bad_proof = proof;
                 bad_proof.next_key = wrong_key;
                 assert!(!TestDb::<F, C, V>::verify_key_value_proof(
                     &hasher, key, value, &bad_proof, &root,

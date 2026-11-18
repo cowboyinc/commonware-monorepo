@@ -409,7 +409,7 @@ impl<P: PublicKey> State<P> {
         let mut earliest: Option<Duration> = None;
         for (flow_id, rate) in allocations {
             if let Some(meta) = self.all_flows.get_mut(&flow_id) {
-                meta.rate = rate.clone();
+                meta.rate = rate;
                 meta.last_update = now;
 
                 if matches!(meta.rate, Rate::Unlimited) {
