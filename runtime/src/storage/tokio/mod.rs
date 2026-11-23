@@ -15,6 +15,8 @@ use tracing::warn;
 #[cfg(not(unix))]
 mod fallback;
 #[cfg(unix)]
+mod files;
+#[cfg(unix)]
 mod unix;
 
 /// Syncs a directory to ensure directory entry changes are durable.
@@ -58,6 +60,8 @@ pub struct Storage {
     lock: Arc<Mutex<()>>,
     cfg: Config,
     pool: BufferPool,
+    #[cfg(unix)]
+    files: Arc<files::Files>,
     /// Directory syncs issued by blob removals.
     #[cfg(all(unix, test))]
     dir_syncs: Arc<std::sync::atomic::AtomicUsize>,
@@ -72,6 +76,8 @@ impl Storage {
             lock: Arc::new(Mutex::new(())),
             cfg,
             pool,
+            #[cfg(unix)]
+            files: files::Files::shared(),
             #[cfg(all(unix, test))]
             dir_syncs: Arc::default(),
             #[cfg(test)]
@@ -197,9 +203,20 @@ impl crate::Storage for Storage {
             // Convert to a blocking std::fs::File
             let file = file.into_std().await;
 
-            // Construct the blob
+            let files = self.files.clone();
+            let handle = tokio::task::spawn_blocking(move || files.register(&path, file))
+                .await
+                .map_err(|_| Error::ReadFailed)?
+                .map_err(|e| Error::BlobOpenFailed(partition.into(), hex(name), e))?;
+            // Construct the logical blob without retaining a descriptor per section.
             Ok((
-                Self::Blob::new(partition.into(), name, file, self.pool.clone()),
+                Self::Blob::from_handle(
+                    partition.into(),
+                    name,
+                    self.files.clone(),
+                    handle,
+                    self.pool.clone(),
+                ),
                 logical_size,
                 blob_version,
             ))
@@ -219,12 +236,26 @@ impl crate::Storage for Storage {
         super::validate_partition_name(partition)?;
 
         // Acquire the filesystem lock
-        let _guard = self.lock.lock().await;
+        let guard = self.lock.clone().lock_owned().await;
+        #[cfg(not(unix))]
+        let _guard = guard;
 
         // Remove all related files
         let path = self.cfg.storage_directory.join(partition);
         if let Some(name) = name {
             let blob_path = path.join(hex(name));
+            #[cfg(unix)]
+            {
+                let files = self.files.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    files.remove(&blob_path, false)
+                })
+                .await
+                .map_err(|_| Error::WriteFailed)?
+                .map_err(|_| Error::BlobMissing(partition.into(), hex(name)))?;
+            }
+            #[cfg(not(unix))]
             fs::remove_file(blob_path)
                 .await
                 .map_err(|_| Error::BlobMissing(partition.into(), hex(name)))?;
@@ -238,6 +269,19 @@ impl crate::Storage for Storage {
             self.dir_syncs
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
+            #[cfg(unix)]
+            {
+                let files = self.files.clone();
+                let removed = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    files.remove(&removed, true)
+                })
+                .await
+                .map_err(|_| Error::WriteFailed)?
+                .map_err(|_| Error::PartitionMissing(partition.into()))?;
+            }
+            #[cfg(not(unix))]
             fs::remove_dir_all(&path)
                 .await
                 .map_err(|_| Error::PartitionMissing(partition.into()))?;
@@ -276,8 +320,13 @@ impl crate::Storage for Storage {
         for name in names {
             let guard = self.lock.clone().lock_owned().await;
             let blob_path = path.join(hex(name));
+            #[cfg(unix)]
+            let files = self.files.clone();
             let unlinked = tokio::task::spawn_blocking(move || {
                 let _guard = guard;
+                #[cfg(unix)]
+                return files.remove(&blob_path, false);
+                #[cfg(not(unix))]
                 std::fs::remove_file(blob_path)
             })
             .await
@@ -357,6 +406,123 @@ mod tests {
     fn test_pool() -> BufferPool {
         let mut registry = Registry::default();
         BufferPool::new(BufferPoolConfig::for_storage(), &mut registry)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_blobs_fit_a_low_descriptor_limit() {
+        let executable = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", "ulimit -n 384 && exec \"$@\"", "descriptor-test"])
+            .arg(executable)
+            .args([
+                "--exact",
+                "storage::tokio::tests::retained_blobs_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "subprocess helper with a private descriptor limit"]
+    async fn retained_blobs_child() {
+        let directory =
+            env::temp_dir().join(format!("storage_descriptors_{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let storage = Storage::new(Config::new(directory.clone(), 1024), test_pool());
+        let mut blobs = Vec::new();
+        for index in 0..1024u64 {
+            let (blob, size) = storage.open("history", &index.to_be_bytes()).await.unwrap();
+            assert_eq!(size, 0);
+            blob.write_at(0, index.to_be_bytes().to_vec())
+                .await
+                .unwrap();
+            blobs.push(blob);
+        }
+        // Reading old sections evicts newer ones. All handles must retain the
+        // same contents, including unsynced writes followed by a later sync.
+        for (index, blob) in blobs.iter().enumerate().rev() {
+            assert_eq!(
+                blob.read_at(0, 8).await.unwrap().coalesce(),
+                (index as u64).to_be_bytes()
+            );
+        }
+        for (chunk, sections) in blobs.chunks(32).enumerate() {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (offset, blob) in sections.iter().cloned().enumerate() {
+                tasks.spawn(async move {
+                    blob.sync().await.unwrap();
+                    let value = (1024 + chunk * 32 + offset) as u64;
+                    blob.write_at_sync(0, value.to_be_bytes().to_vec())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        blob.read_at(0, 8).await.unwrap().coalesce(),
+                        value.to_be_bytes()
+                    );
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        }
+        drop(blobs);
+        drop(storage);
+        let reopened = Storage::new(Config::new(directory.clone(), 1024), test_pool());
+        let mut blobs = Vec::new();
+        for index in 0..1024u64 {
+            let (blob, size) = reopened
+                .open("history", &index.to_be_bytes())
+                .await
+                .unwrap();
+            assert_eq!(size, 8);
+            assert_eq!(
+                blob.read_at(0, 8).await.unwrap().coalesce(),
+                (index + 1024).to_be_bytes()
+            );
+            blobs.push(blob);
+        }
+        assert!(std::fs::read_dir("/proc/self/fd").unwrap().count() < 384);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evicted_handles_keep_their_inode_after_remove_and_recreate() {
+        let directory =
+            env::temp_dir().join(format!("storage_descriptors_{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let storage = Storage::new(Config::new(directory.clone(), 1024), test_pool());
+        let (old, _) = storage.open("retained", b"old").await.unwrap();
+        old.write_at(0, b"original").await.unwrap();
+        for index in 0..1024u64 {
+            storage.open("evict", &index.to_be_bytes()).await.unwrap();
+        }
+        // A second runtime instance must share removal bookkeeping.
+        let other = Storage::new(Config::new(directory.clone(), 1024), test_pool());
+        other.remove("retained", Some(b"old")).await.unwrap();
+        let (new, size) = other.open("retained", b"old").await.unwrap();
+        assert_eq!(size, 0);
+        new.write_at_sync(0, b"new").await.unwrap();
+        assert_eq!(
+            old.read_at(0, 8).await.unwrap().coalesce(),
+            b"original".as_slice()
+        );
+        old.resize(4).await.unwrap();
+        old.sync().await.unwrap();
+        assert_eq!(
+            new.read_at(0, 3).await.unwrap().coalesce(),
+            b"new".as_slice()
+        );
+
+        storage.remove("retained", None).await.unwrap();
+        assert_eq!(
+            new.read_at(0, 3).await.unwrap().coalesce(),
+            b"new".as_slice()
+        );
     }
 
     #[tokio::test]
