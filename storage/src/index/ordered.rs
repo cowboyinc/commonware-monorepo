@@ -72,6 +72,15 @@ impl<T: Translator, V: Send + Sync> Index<T, V> {
         }
     }
 
+    /// Return the first translated key at or after `translator.transform(key)`, without wrapping.
+    /// Colliding original keys share one translated key. Input lengths follow the translator's
+    /// contract, as with the other index lookups.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn translated_key_at_or_after(&self, key: &[u8]) -> Option<T::Key> {
+        let k = self.translator.transform(key);
+        self.map.range(k..).next().map(|(key, _)| *key)
+    }
+
     /// Like [Ordered::next_translated_key] but without cycling around to the first key if there is
     /// no next key.
     pub(super) fn next_translated_key_no_cycle<'a>(
@@ -289,7 +298,7 @@ mod tests {
     use crate::translator::OneCap;
     use commonware_formatting::hex;
     use commonware_macros::test_traced;
-    use commonware_runtime::{deterministic, Runner};
+    use commonware_runtime::{deterministic, Runner, Supervisor};
 
     #[test_traced]
     fn test_ordered_empty_index() {
@@ -301,6 +310,47 @@ mod tests {
             assert!(index.last_translated_key().is_none());
             assert!(index.prev_translated_key(b"key").is_none());
             assert!(index.next_translated_key(b"key").is_none());
+        });
+    }
+
+    #[commonware_macros::stability(ALPHA)]
+    #[test_traced]
+    fn test_translated_key_at_or_after() {
+        let runner = deterministic::Runner::default();
+        runner.start(|context| async move {
+            let mut index = Index::<_, u64>::new(context.child("index"), OneCap);
+            assert_eq!(index.translated_key_at_or_after(b""), None);
+            assert_eq!(index.translated_key_at_or_after(&[0xff]), None);
+
+            index.insert(&[0x10, 0xff], 1);
+            index.insert(&[0x10, 0x00], 2);
+            index.insert(&[0x30], 3);
+            index.insert(&[0xfe], 4);
+            let metrics = context.encode();
+            let state = context.auditor().state();
+            for _ in 0..100 {
+                assert_eq!(index.translated_key_at_or_after(b""), Some(0x10));
+                assert_eq!(index.translated_key_at_or_after(&[0x10]), Some(0x10));
+                assert_eq!(
+                    index.translated_key_at_or_after(&[0x10, 0xff, 0xff]),
+                    Some(0x10)
+                );
+                assert_eq!(index.translated_key_at_or_after(&[0x20]), Some(0x30));
+                assert_eq!(index.translated_key_at_or_after(&[0x30]), Some(0x30));
+                assert_eq!(index.translated_key_at_or_after(&[0xfd]), Some(0xfe));
+                assert_eq!(index.translated_key_at_or_after(&[0xfe]), Some(0xfe));
+                assert_eq!(index.translated_key_at_or_after(&[0xff]), None);
+            }
+            assert_eq!(context.auditor().state(), state);
+            assert_eq!(context.encode(), metrics);
+            assert_eq!(index.keys(), 3);
+            assert_eq!(index.items(), 4);
+            assert_eq!(index.get(&[0x10]).copied().collect::<Vec<_>>(), vec![2, 1]);
+
+            index.insert(&[0xff], 5);
+            assert_eq!(index.translated_key_at_or_after(&[0xff]), Some(0xff));
+            index.remove(&[0xff]);
+            assert_eq!(index.translated_key_at_or_after(&[0xff]), None);
         });
     }
 
