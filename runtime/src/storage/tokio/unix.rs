@@ -1,4 +1,7 @@
-use super::Header;
+use super::{
+    files::{Files, Handle},
+    Header,
+};
 use crate::{Buf, BufferPool, Error, IoBufs, IoBufsMut};
 use cfg_if::cfg_if;
 use commonware_formatting::hex;
@@ -15,10 +18,19 @@ use tokio::task;
 const IOVEC_BATCH_SIZE: usize = 32;
 
 #[derive(Clone)]
+enum Descriptor {
+    Cached {
+        files: Arc<Files>,
+        handle: Arc<Handle>,
+    },
+    Owned(Arc<File>),
+}
+
+#[derive(Clone)]
 pub struct Blob {
     partition: String,
     name: Vec<u8>,
-    file: Arc<File>,
+    descriptor: Descriptor,
     pool: BufferPool,
 }
 
@@ -27,8 +39,32 @@ impl Blob {
         Self {
             partition,
             name: name.into(),
-            file: Arc::new(file),
+            descriptor: Descriptor::Owned(Arc::new(file)),
             pool,
+        }
+    }
+
+    pub(super) fn from_handle(
+        partition: String,
+        name: &[u8],
+        files: Arc<Files>,
+        handle: Arc<Handle>,
+        pool: BufferPool,
+    ) -> Self {
+        Self {
+            partition,
+            name: name.into(),
+            descriptor: Descriptor::Cached { files, handle },
+            pool,
+        }
+    }
+
+    fn file(&self) -> Result<Arc<File>, Error> {
+        match &self.descriptor {
+            Descriptor::Cached { files, handle } => files.file(handle).map_err(|error| {
+                Error::BlobOpenFailed(self.partition.clone(), hex(&self.name), error)
+            }),
+            Descriptor::Owned(file) => Ok(file.clone()),
         }
     }
 
@@ -116,12 +152,13 @@ impl crate::Blob for Blob {
         let mut bufs = bufs.into();
         // SAFETY: `len` bytes are filled via read_exact below.
         unsafe { bufs.set_len(len) };
-        let file = self.file.clone();
+        let blob = self.clone();
         let pool = self.pool.clone();
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
         task::spawn_blocking(move || {
+            let file = blob.file()?;
             if let Some(buf) = bufs.as_single_mut() {
                 // Read directly into the single buffer (zero-copy).
                 file.read_exact_at(buf.as_mut(), offset)?;
@@ -140,13 +177,16 @@ impl crate::Blob for Blob {
 
     async fn write_at(&self, offset: u64, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
         let bufs = bufs.into();
-        let file = self.file.clone();
+        let blob = self.clone();
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
-        task::spawn_blocking(move || match bufs.try_into_single() {
-            Ok(buf) => Self::write_single_at(&file, offset, buf.as_ref()),
-            Err(bufs) => Self::write_vectored_at(&file, offset, bufs, None),
+        task::spawn_blocking(move || {
+            let file = blob.file()?;
+            match bufs.try_into_single() {
+                Ok(buf) => Self::write_single_at(&file, offset, buf.as_ref()),
+                Err(bufs) => Self::write_vectored_at(&file, offset, bufs, None),
+            }
         })
         .await
         .map_err(|_| Error::WriteFailed)?
@@ -158,7 +198,7 @@ impl crate::Blob for Blob {
         bufs: impl Into<IoBufs> + Send,
     ) -> Result<(), Error> {
         let bufs = bufs.into();
-        let file = self.file.clone();
+        let blob = self.clone();
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
@@ -170,6 +210,7 @@ impl crate::Blob for Blob {
         cfg_if! {
             if #[cfg(target_os = "linux")] {
                 task::spawn_blocking(move || {
+            let file = blob.file()?;
                     Self::write_vectored_at(&file, offset, bufs, Some(libc::RWF_SYNC))
                 })
                 .await
@@ -178,6 +219,7 @@ impl crate::Blob for Blob {
                 let partition = self.partition.clone();
                 let name = self.name.clone();
                 task::spawn_blocking(move || {
+            let file = blob.file()?;
                     Self::write_vectored_at(&file, offset, bufs, None)?;
                     file.sync_all().map_err(|e| {
                         Error::BlobSyncFailed(partition, hex(&name), e)
@@ -190,25 +232,29 @@ impl crate::Blob for Blob {
     }
 
     async fn resize(&self, len: u64) -> Result<(), Error> {
-        let file = self.file.clone();
+        let blob = self.clone();
         let len = len
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
-        task::spawn_blocking(move || file.set_len(len))
-            .await
-            .map_err(|e| e.into())
-            .and_then(|r| r)
-            .map_err(|e| Error::BlobResizeFailed(self.partition.clone(), hex(&self.name), e))?;
+        task::spawn_blocking(move || {
+            blob.file()?.set_len(len).map_err(|error| {
+                Error::BlobResizeFailed(blob.partition.clone(), hex(&blob.name), error)
+            })
+        })
+        .await
+        .map_err(|_| Error::WriteFailed)??;
         Ok(())
     }
 
     async fn sync(&self) -> Result<(), Error> {
-        let file = self.file.clone();
-        task::spawn_blocking(move || file.sync_all())
-            .await
-            .map_err(|e| e.into())
-            .and_then(|r| r)
-            .map_err(|e| Error::BlobSyncFailed(self.partition.clone(), hex(&self.name), e))?;
+        let blob = self.clone();
+        task::spawn_blocking(move || {
+            blob.file()?.sync_all().map_err(|error| {
+                Error::BlobSyncFailed(blob.partition.clone(), hex(&blob.name), error)
+            })
+        })
+        .await
+        .map_err(|_| Error::WriteFailed)??;
         Ok(())
     }
 }
